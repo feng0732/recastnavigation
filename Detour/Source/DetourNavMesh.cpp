@@ -458,71 +458,204 @@ void dtNavMesh::connectExtLinks(dtMeshTile* tile, dtMeshTile* target, int side)
 void dtNavMesh::connectExtOffMeshLinks(dtMeshTile* tile, dtMeshTile* target, int side)
 {
 	if (!tile) return;
-	
+
 	// Connect off-mesh links.
 	// We are interested on links which land from target tile to this tile.
 	const unsigned char oppositeSide = (side == -1) ? 0xff : (unsigned char)dtOppositeTile(side);
-	
+
 	for (int i = 0; i < target->header->offMeshConCount; ++i)
 	{
 		dtOffMeshConnection* targetCon = &target->offMeshCons[i];
 		if (targetCon->side != oppositeSide)
 			continue;
+		connectOffMeshConnection(tile, target, targetCon, side);
+	}
+}
 
-		dtPoly* targetPoly = &target->polys[targetCon->poly];
-		// Skip off-mesh connections which start location could not be connected at all.
-		if (targetPoly->firstLink == DT_NULL_LINK)
-			continue;
-		
-		const float halfExtents[3] = { targetCon->rad, target->header->walkableClimb, targetCon->rad };
-		
-		// Find polygon to connect to.
-		const float* p = &targetCon->pos[3];
-		float nearestPt[3];
-		dtPolyRef ref = findNearestPolyInTile(tile, p, halfExtents, nearestPt);
-		if (!ref)
-			continue;
-		// findNearestPoly may return too optimistic results, further check to make sure. 
-		if (dtSqr(nearestPt[0]-p[0])+dtSqr(nearestPt[2]-p[2]) > dtSqr(targetCon->rad))
-			continue;
-		// Make sure the location is on current mesh.
-		float* v = &target->verts[targetPoly->verts[1]*3];
-		dtVcopy(v, nearestPt);
-				
-		// Link off-mesh connection to target poly.
-		unsigned int idx = allocLink(target);
-		if (idx != DT_NULL_LINK)
+void dtNavMesh::connectOffMeshConnection(dtMeshTile* tile, dtMeshTile* target,
+										 dtOffMeshConnection* targetCon, int side)
+{
+	if (!tile || !target || !targetCon) return;
+
+	dtPoly* targetPoly = &target->polys[targetCon->poly];
+	// Skip off-mesh connections which start location could not be connected at all.
+	if (targetPoly->firstLink == DT_NULL_LINK)
+		return;
+
+	// Non-boundary links are stored with side 0xff.
+	const unsigned char linkSide = (side == -1) ? 0xff : (unsigned char)side;
+	// Preserve the historical side encoding for the connection->landing
+	// link when crossing a tile border (the opposite side of the owner).
+	const unsigned char conLinkSide = (side == -1) ? 0xff
+		: (unsigned char)dtOppositeTile(side);
+
+	const float halfExtents[3] = { targetCon->rad, target->header->walkableClimb, targetCon->rad };
+
+	// Find polygon to connect to.
+	const float* p = &targetCon->pos[3];
+	float nearestPt[3];
+	dtPolyRef ref = findNearestPolyInTile(tile, p, halfExtents, nearestPt);
+	if (!ref)
+		return;
+	// findNearestPoly may return too optimistic results, further check to make sure.
+	if (dtSqr(nearestPt[0]-p[0])+dtSqr(nearestPt[2]-p[2]) > dtSqr(targetCon->rad))
+		return;
+	// Make sure the location is on current mesh.
+	float* v = &target->verts[targetPoly->verts[1]*3];
+	dtVcopy(v, nearestPt);
+
+	// Link off-mesh connection to target poly.
+	unsigned int idx = allocLink(target);
+	if (idx != DT_NULL_LINK)
+	{
+		dtLink* link = &target->links[idx];
+		link->ref = ref;
+		link->edge = (unsigned char)1;
+		link->side = conLinkSide;
+		link->bmin = link->bmax = 0;
+		// Add to linked list.
+		link->next = targetPoly->firstLink;
+		targetPoly->firstLink = idx;
+	}
+
+	// Link target poly to off-mesh connection.
+	if (targetCon->flags & DT_OFFMESH_CON_BIDIR)
+	{
+		unsigned int tidx = allocLink(tile);
+		if (tidx != DT_NULL_LINK)
 		{
-			dtLink* link = &target->links[idx];
-			link->ref = ref;
-			link->edge = (unsigned char)1;
-			link->side = oppositeSide;
+			const unsigned short landPolyIdx = (unsigned short)decodePolyIdPoly(ref);
+			dtPoly* landPoly = &tile->polys[landPolyIdx];
+			dtLink* link = &tile->links[tidx];
+			link->ref = getPolyRefBase(target) | (dtPolyRef)(targetCon->poly);
+			link->edge = 0xff;
+			link->side = linkSide;
 			link->bmin = link->bmax = 0;
 			// Add to linked list.
-			link->next = targetPoly->firstLink;
-			targetPoly->firstLink = idx;
+			link->next = landPoly->firstLink;
+			landPoly->firstLink = tidx;
 		}
-		
-		// Link target poly to off-mesh connection.
-		if (targetCon->flags & DT_OFFMESH_CON_BIDIR)
+	}
+}
+
+bool dtNavMesh::isNeighbourCell(int ax, int ay, int bx, int by)
+{
+	const int dx = bx - ax;
+	const int dy = by - ay;
+	// Same cell or one of the 8 surrounding cells.
+	return dx >= -1 && dx <= 1 && dy >= -1 && dy <= 1;
+}
+
+void dtNavMesh::connectRemoteOffMeshLinks(dtMeshTile* newTile)
+{
+	// Connect off-mesh links which span non-adjacent (remote) tiles. The
+	// regular addTile() hookup only covers the 8-neighbourhood, so an
+	// off-mesh connection whose end point lands further away would remain
+	// dangling. This runs every time a tile is added/reloaded and connects
+	// links in both directions of the change:
+	//  1. connections owned by the newly added tile which land in remote
+	//     tiles already present in the mesh;
+	//  2. connections owned by existing remote tiles which land in the
+	//     newly added tile (previously dangling links).
+	for (int i = 0; i < m_maxTiles; ++i)
+	{
+		dtMeshTile* tile = &m_tiles[i];
+		if (!tile->header)
+			continue;
+
+		for (int j = 0; j < tile->header->offMeshConCount; ++j)
 		{
-			unsigned int tidx = allocLink(tile);
-			if (tidx != DT_NULL_LINK)
+			dtOffMeshConnection* con = &tile->offMeshCons[j];
+			dtPoly* ownerPoly = &tile->polys[con->poly];
+			// Skip off-mesh connections whose start point was never based.
+			if (ownerPoly->firstLink == DT_NULL_LINK)
+				continue;
+
+			// Locate the tile cell containing the landing end point.
+			int lx, ly;
+			calcTileLoc(&con->pos[3], &lx, &ly);
+
+			const bool ownerIsNew = (newTile != 0 && tile == newTile);
+			if (newTile)
 			{
-				const unsigned short landPolyIdx = (unsigned short)decodePolyIdPoly(ref);
-				dtPoly* landPoly = &tile->polys[landPolyIdx];
-				dtLink* link = &tile->links[tidx];
-				link->ref = getPolyRefBase(target) | (dtPolyRef)(targetCon->poly);
-				link->edge = 0xff;
-				link->side = (unsigned char)(side == -1 ? 0xff : side);
-				link->bmin = link->bmax = 0;
-				// Add to linked list.
-				link->next = landPoly->firstLink;
-				landPoly->firstLink = tidx;
+				// While adding a tile, only connections that involve the new
+				// tile (as owner or as landing cell) need to be (re)tried.
+				const bool landsInNew = (lx == newTile->header->x && ly == newTile->header->y);
+				if (!ownerIsNew && !landsInNew)
+					continue;
+			}
+
+			// Neighbour cells (and the owning cell itself) are handled by the
+			// regular border/same-cell hookup in addTile().
+			if (isNeighbourCell(tile->header->x, tile->header->y, lx, ly))
+				continue;
+
+			if (ownerIsNew)
+			{
+				// The new tile owns the connection. None of the tiles at the
+				// landing cell can have linked to it before, so connect to
+				// every layer existing at that cell.
+				static const int MAX_LAND = 32;
+				dtMeshTile* landTiles[MAX_LAND];
+				const int nland = getTilesAt(lx, ly, landTiles, MAX_LAND);
+				for (int k = 0; k < nland; ++k)
+				{
+					dtMeshTile* land = landTiles[k];
+					if (land == tile)
+						continue;
+					// Remote links are non-boundary links (side 0xff).
+					connectOffMeshConnection(land, tile, con, -1);
+				}
+			}
+			else
+			{
+				// An existing connection lands in the cell of the new tile.
+				// Only connect to the newly added tile: other layers at the
+				// same cell were already connected when they were added, and
+				// connecting to them again would create duplicate links.
+				connectOffMeshConnection(newTile, tile, con, -1);
 			}
 		}
 	}
+}
 
+void dtNavMesh::unconnectRemoteOffMeshLinks(dtMeshTile* tile, dtMeshTile* target)
+{
+	if (!tile || !target) return;
+
+	// Nothing to do when the cells touch each other: border links of
+	// neighbouring cells are removed by unconnectLinks() in removeTile().
+	if (isNeighbourCell(tile->header->x, tile->header->y, target->header->x, target->header->y))
+		return;
+
+	const unsigned int targetNum = decodePolyIdTile(getTileRef(target));
+
+	for (int i = 0; i < tile->header->polyCount; ++i)
+	{
+		dtPoly* poly = &tile->polys[i];
+		unsigned int j = poly->firstLink;
+		unsigned int pj = DT_NULL_LINK;
+		while (j != DT_NULL_LINK)
+		{
+			if (decodePolyIdTile(tile->links[j].ref) == targetNum)
+			{
+				// Remove link.
+				unsigned int nj = tile->links[j].next;
+				if (pj == DT_NULL_LINK)
+					poly->firstLink = nj;
+				else
+					tile->links[pj].next = nj;
+				freeLink(tile, j);
+				j = nj;
+			}
+			else
+			{
+				// Advance
+				pj = j;
+				j = tile->links[j].next;
+			}
+		}
+	}
 }
 
 void dtNavMesh::connectIntLinks(dtMeshTile* tile)
@@ -1053,10 +1186,15 @@ dtStatus dtNavMesh::addTile(unsigned char* data, int dataSize, int flags,
 			connectExtOffMeshLinks(neis[j], tile, dtOppositeTile(i));
 		}
 	}
-	
+
+	// Connect off-mesh links which span non-adjacent (remote) tiles. This
+	// also retries links which were created while their landing tile was
+	// absent, so reloading a tile completes previously dangling connections.
+	connectRemoteOffMeshLinks(tile);
+
 	if (result)
 		*result = getTileRef(tile);
-	
+
 	return DT_SUCCESS;
 }
 
@@ -1293,7 +1431,20 @@ dtStatus dtNavMesh::removeTile(dtTileRef ref, unsigned char** data, int* dataSiz
 		for (int j = 0; j < nneis; ++j)
 			unconnectLinks(neis[j], tile);
 	}
-		
+
+	// Prune off-mesh links owned by remote (non-adjacent) tiles which landed
+	// in the tile being removed. The removed tile's own links are discarded
+	// with its data and rebuilt from scratch if the tile is added again, so
+	// only the surviving tiles need their incoming remote links pruned
+	// (mirrors the one-directional neighbour cleanup above).
+	for (int i = 0; i < m_maxTiles; ++i)
+	{
+		dtMeshTile* other = &m_tiles[i];
+		if (!other->header || other == tile)
+			continue;
+		unconnectRemoteOffMeshLinks(other, tile);
+	}
+
 	// Reset tile.
 	if (tile->flags & DT_TILE_FREE_DATA)
 	{

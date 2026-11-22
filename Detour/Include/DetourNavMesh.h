@@ -635,9 +635,41 @@ private:
 	void connectExtLinks(dtMeshTile* tile, dtMeshTile* target, int side);
 	/// Builds external polygon links for a tile.
 	void connectExtOffMeshLinks(dtMeshTile* tile, dtMeshTile* target, int side);
-	
+
+	/// Attempts to connect a single off-mesh connection owned by the target
+	/// tile to a landing polygon in the specified tile.
+	/// Used both for neighbour connections (side in 0..7, or -1 for the same
+	/// cell) and for non-adjacent (remote) tile connections (side == -1).
+	/// @param[in]	tile		Tile which is checked for a landing polygon.
+	/// @param[in]	target		Tile owning the off-mesh connection.
+	/// @param[in]	con			The off-mesh connection to connect.
+	/// @param[in]	side		The boundary side used for the created links,
+	///							or -1 to mark the links as non-boundary (0xff).
+	void connectOffMeshConnection(dtMeshTile* tile, dtMeshTile* target,
+								  dtOffMeshConnection* con, int side);
+
+	/// Connects off-mesh links whose endpoints land in tiles which are not
+	/// part of the 8-neighbourhood (non-adjacent, remote tile connections).
+	/// Handles connections owned by the newly added tile as well as
+	/// connections already present in the mesh which land in the new tile,
+	/// so that adding/reloading a tile can satisfy previously dangling links.
+	/// @param[in]	newTile		The tile that was just added (may be null).
+	void connectRemoteOffMeshLinks(dtMeshTile* newTile);
+
+	/// Removes off-mesh links that connect the two specified non-adjacent
+	/// tiles. Only link entries whose owning polygon tile and the referenced
+	/// polygon tile are both remote (non-neighbour) cells are removed.
+	/// @param[in]	tile		Tile whose links are pruned.
+	/// @param[in]	target		The tile being removed.
+	void unconnectRemoteOffMeshLinks(dtMeshTile* tile, dtMeshTile* target);
+
 	/// Removes external links at specified side.
 	void unconnectLinks(dtMeshTile* tile, dtMeshTile* target);
+
+	/// Returns true when the two tile grid locations share an edge or a
+	/// corner (i.e. the target cell is one of the 8 neighbours, or the same
+	/// cell). Used to tell remote (non-adjacent) tile connections apart.
+	static bool isNeighbourCell(int ax, int ay, int bx, int by);
 	
 
 	// TODO: These methods are duplicates from dtNavMeshQuery, but are needed for off-mesh connection finding.

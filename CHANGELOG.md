@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 <h2>[Unreleased](https://github.com/recastnavigation/recastnavigation/compare/1.6.0...HEAD)</h2>
+
+### Added
+- Off-mesh connections can now span non-adjacent (remote) tiles. Previously an off-mesh connection whose landing end point was outside the owning tile's 8-neighbourhood was never connected. `dtNavMesh::addTile()` now connects these remote links in both directions (including bidirectional reverse links), retries dangling links when the landing tile is added/reloaded, and `removeTile()` prunes the affected remote links.
 <h2>[1.6.0](https://github.com/recastnavigation/recastnavigation/compare/1.5.1...1.6.0) - 2023-05-21</h2>
 
 ### Added
