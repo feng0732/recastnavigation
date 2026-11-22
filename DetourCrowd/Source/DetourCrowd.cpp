@@ -285,8 +285,37 @@ static int addToPathQueue(dtCrowdAgent* newag, dtCrowdAgent** agents, const int 
 	}
 	
 	agents[slot] = newag;
-	
+
 	return dtMin(nagents+1, maxAgents);
+}
+
+/// Returns the user defined connection type bits carried by an off-mesh
+/// connection polygon, or zero for a legacy, untyped connection.
+static unsigned char getOffMeshConnectionType(const dtNavMesh* nav, const dtPolyRef conRef)
+{
+	const dtMeshTile* tile = 0;
+	const dtPoly* poly = 0;
+	if (dtStatusFailed(nav->getTileAndPolyByRef(conRef, &tile, &poly)))
+		return 0;
+	if (poly->getType() != DT_POLYTYPE_OFFMESH_CONNECTION)
+		return 0;
+	return (unsigned char)(poly->flags & DT_CROWD_OFFMESH_TYPE_MASK);
+}
+
+/// Deterministic hash of a polygon reference into the occupancy table.
+static unsigned int offMeshOccupancyHash(const dtPolyRef ref, const int tableSize)
+{
+	// Fibonacci style mixing on the packed poly id; salt/tile/poly bits all
+	// contribute so distinct references do not alias on a single component.
+	dtPolyRef key = ref;
+	key = (~key) + (key << 21);
+	key = key ^ (key >> 24);
+	key = (key + (key << 3)) + (key << 8);
+	key = key ^ (key >> 14);
+	key = (key + (key << 2)) + (key << 4);
+	key = key ^ (key >> 28);
+	key = key + (key << 31);
+	return (unsigned int)(key % (dtPolyRef)tableSize);
 }
 
 
@@ -333,6 +362,11 @@ dtCrowd::dtCrowd() :
 	m_agents(0),
 	m_activeAgents(0),
 	m_agentAnims(0),
+	m_offMeshOccupancyRefs(0),
+	m_offMeshOccupancyAgents(0),
+	m_offMeshOccupancySize(0),
+	m_offMeshArrivalCallback(0),
+	m_offMeshArrivalUserData(0),
 	m_obstacleQuery(0),
 	m_grid(0),
 	m_pathResult(0),
@@ -361,7 +395,13 @@ void dtCrowd::purge()
 
 	dtFree(m_agentAnims);
 	m_agentAnims = 0;
-	
+
+	dtFree(m_offMeshOccupancyRefs);
+	m_offMeshOccupancyRefs = 0;
+	dtFree(m_offMeshOccupancyAgents);
+	m_offMeshOccupancyAgents = 0;
+	m_offMeshOccupancySize = 0;
+
 	dtFree(m_pathResult);
 	m_pathResult = 0;
 	
@@ -437,7 +477,17 @@ bool dtCrowd::init(const int maxAgents, const float maxAgentRadius, dtNavMesh* n
 	m_agentAnims = (dtCrowdAgentAnimation*)dtAlloc(sizeof(dtCrowdAgentAnimation)*m_maxAgents, DT_ALLOC_PERM);
 	if (!m_agentAnims)
 		return false;
-	
+
+	// Deterministic occupancy table. Sized with headroom so open addressing stays
+	// sparse even when every agent occupies a different connection at once.
+	m_offMeshOccupancySize = m_maxAgents*4 + 1;
+	if (m_offMeshOccupancySize < 16)
+		m_offMeshOccupancySize = 16;
+	m_offMeshOccupancyRefs = (dtPolyRef*)dtAlloc(sizeof(dtPolyRef)*m_offMeshOccupancySize, DT_ALLOC_PERM);
+	m_offMeshOccupancyAgents = (int*)dtAlloc(sizeof(int)*m_offMeshOccupancySize, DT_ALLOC_PERM);
+	if (!m_offMeshOccupancyRefs || !m_offMeshOccupancyAgents)
+		return false;
+
 	for (int i = 0; i < m_maxAgents; ++i)
 	{
 		new(&m_agents[i]) dtCrowdAgent();
@@ -448,7 +498,19 @@ bool dtCrowd::init(const int maxAgents, const float maxAgentRadius, dtNavMesh* n
 
 	for (int i = 0; i < m_maxAgents; ++i)
 	{
+		memset(&m_agentAnims[i], 0, sizeof(dtCrowdAgentAnimation));
 		m_agentAnims[i].active = false;
+		m_agentAnims[i].polyRef = 0;
+		m_agentAnims[i].prevRef = 0;
+		m_agentAnims[i].landRef = 0;
+		m_agentAnims[i].occupancyHeld = false;
+		m_agentAnims[i].arrivalNotified = false;
+	}
+
+	for (int i = 0; i < m_offMeshOccupancySize; ++i)
+	{
+		m_offMeshOccupancyRefs[i] = 0;
+		m_offMeshOccupancyAgents[i] = -1;
 	}
 
 	// The navquery is mostly used for local searches, no need for large node pool.
@@ -557,9 +619,22 @@ int dtCrowd::addAgent(const float* pos, const dtCrowdAgentParams* params)
 		ag->state = DT_CROWDAGENT_STATE_WALKING;
 	else
 		ag->state = DT_CROWDAGENT_STATE_INVALID;
-	
+
 	ag->targetState = DT_CROWDAGENT_TARGET_NONE;
-	
+	ag->traversalState = DT_CROWD_TRAVERSAL_NONE;
+
+	// Reset any traversal state left over from a previous occupant of this slot.
+	dtCrowdAgentAnimation* anim = &m_agentAnims[idx];
+	if (anim->active && anim->occupancyHeld)
+		releaseOffMeshOccupancy(anim->polyRef, idx);
+	memset(anim, 0, sizeof(dtCrowdAgentAnimation));
+	anim->active = false;
+	anim->polyRef = 0;
+	anim->prevRef = 0;
+	anim->landRef = 0;
+	anim->occupancyHeld = false;
+	anim->arrivalNotified = false;
+
 	ag->active = true;
 
 	return idx;
@@ -569,10 +644,22 @@ int dtCrowd::addAgent(const float* pos, const dtCrowdAgentParams* params)
 ///
 /// The agent is deactivated and will no longer be processed.  Its #dtCrowdAgent object
 /// is not removed from the pool.  It is marked as inactive so that it is available for reuse.
+/// Any off-mesh connection traversal the agent was performing is aborted and its
+/// occupancy slot is released.
 void dtCrowd::removeAgent(const int idx)
 {
 	if (idx >= 0 && idx < m_maxAgents)
 	{
+		dtCrowdAgent* ag = &m_agents[idx];
+		if (ag->active)
+		{
+			dtCrowdAgentAnimation* anim = &m_agentAnims[idx];
+			if (anim->active && anim->occupancyHeld)
+				releaseOffMeshOccupancy(anim->polyRef, idx);
+			memset(anim, 0, sizeof(dtCrowdAgentAnimation));
+			anim->active = false;
+			ag->traversalState = DT_CROWD_TRAVERSAL_NONE;
+		}
 		m_agents[idx].active = false;
 	}
 }
@@ -688,6 +775,11 @@ void dtCrowd::updateMoveRequest(const float /*dt*/)
 			continue;
 		if (ag->state == DT_CROWDAGENT_STATE_INVALID)
 			continue;
+		// An agent inside an off-mesh traversal owns its corridor until it
+		// leaves the connection; do not overwrite or merge paths mid-traversal.
+		if (ag->state == DT_CROWDAGENT_STATE_OFFMESH ||
+			ag->state == DT_CROWDAGENT_STATE_OFFMESH_STALLED)
+			continue;
 		if (ag->targetState == DT_CROWDAGENT_TARGET_NONE || ag->targetState == DT_CROWDAGENT_TARGET_VELOCITY)
 			continue;
 
@@ -788,6 +880,10 @@ void dtCrowd::updateMoveRequest(const float /*dt*/)
 	{
 		dtCrowdAgent* ag = &m_agents[i];
 		if (!ag->active)
+			continue;
+		// Do not apply path results while the corridor is owned by a traversal.
+		if (ag->state == DT_CROWDAGENT_STATE_OFFMESH ||
+			ag->state == DT_CROWDAGENT_STATE_OFFMESH_STALLED)
 			continue;
 		if (ag->targetState == DT_CROWDAGENT_TARGET_NONE || ag->targetState == DT_CROWDAGENT_TARGET_VELOCITY)
 			continue;
@@ -1042,7 +1138,506 @@ void dtCrowd::checkPathValidity(dtCrowdAgent** agents, const int nagents, const 
 		}
 	}
 }
-	
+
+// ---------------------------------------------------------------------------
+// Typed off-mesh connection traversal.
+//
+// A traversal is an explicit, independent agent state. Once an agent enters a
+// connection it cannot be steered by the normal corridor logic: its position,
+// velocity and arrival notification are owned by this code until the agent
+// either successfully leaves the connection on the far side or the traversal
+// is recovered/aborted. Typed connections additionally use a deterministic
+// occupancy table so that simultaneous attempts resolve to exactly one owner,
+// and unidirectional connections reject reverse traversal outright.
+// ---------------------------------------------------------------------------
+
+bool dtCrowd::tryAcquireOffMeshOccupancy(dtPolyRef conRef, const int agentIdx)
+{
+	dtAssert(conRef);
+	dtAssert(m_offMeshOccupancyRefs);
+
+	const unsigned int start = offMeshOccupancyHash(conRef, m_offMeshOccupancySize);
+	unsigned int firstEmpty = 0xffffffff;
+	for (int probe = 0; probe < m_offMeshOccupancySize; ++probe)
+	{
+		const unsigned int slot = (start + (unsigned int)probe) % (unsigned int)m_offMeshOccupancySize;
+		const dtPolyRef key = m_offMeshOccupancyRefs[slot];
+		if (key == 0)
+		{
+			// An empty slot terminates the probe chain for this hash.
+			if (firstEmpty == 0xffffffff)
+				firstEmpty = slot;
+			break;
+		}
+		if (key == conRef)
+		{
+			const int occupant = m_offMeshOccupancyAgents[slot];
+			dtCrowdAgent* other = &m_agents[occupant];
+			dtCrowdAgentAnimation* otherAnim = &m_agentAnims[occupant];
+			if (other->active && other->state != DT_CROWDAGENT_STATE_INVALID && otherAnim->active)
+			{
+				// A live agent already owns this connection. Deterministic
+				// rule: the current owner keeps it.
+				return occupant == agentIdx;
+			}
+			// Stale entry from a traversal that was not cleaned up; reclaim it.
+			m_offMeshOccupancyAgents[slot] = agentIdx;
+			return true;
+		}
+		if (firstEmpty == 0xffffffff)
+			firstEmpty = slot;
+	}
+
+	if (firstEmpty == 0xffffffff)
+		return false; // Table completely saturated; treat as occupied.
+	m_offMeshOccupancyRefs[firstEmpty] = conRef;
+	m_offMeshOccupancyAgents[firstEmpty] = agentIdx;
+	return true;
+}
+
+void dtCrowd::releaseOffMeshOccupancy(dtPolyRef conRef, const int agentIdx)
+{
+	dtAssert(m_offMeshOccupancyRefs);
+	if (!conRef)
+		return;
+
+	const unsigned int start = offMeshOccupancyHash(conRef, m_offMeshOccupancySize);
+	unsigned int hole = 0xffffffff;
+	for (int probe = 0; probe < m_offMeshOccupancySize; ++probe)
+	{
+		const unsigned int slot = (start + (unsigned int)probe) % (unsigned int)m_offMeshOccupancySize;
+		if (m_offMeshOccupancyRefs[slot] == 0)
+			return; // Chain ends; the reference was never stored.
+		if (m_offMeshOccupancyRefs[slot] == conRef && m_offMeshOccupancyAgents[slot] == agentIdx)
+		{
+			hole = slot;
+			break;
+		}
+	}
+	if (hole == 0xffffffff)
+		return;
+
+	// Backward-shift deletion so probe chains of later entries stay reachable.
+	for (;;)
+	{
+		const unsigned int next = (hole + 1u) % (unsigned int)m_offMeshOccupancySize;
+		const dtPolyRef nextKey = m_offMeshOccupancyRefs[next];
+		if (nextKey == 0)
+		{
+			m_offMeshOccupancyRefs[hole] = 0;
+			m_offMeshOccupancyAgents[hole] = -1;
+			return;
+		}
+		const unsigned int nextHome = offMeshOccupancyHash(nextKey, m_offMeshOccupancySize);
+		// The next entry can move into the hole only if its home slot does not
+		// lie in the open interval (hole, next] along the probe order.
+		bool homeInInterval;
+		if (next > hole)
+			homeInInterval = (nextHome > hole && nextHome <= next);
+		else
+			homeInInterval = (nextHome > hole || nextHome <= next);
+		if (!homeInInterval)
+		{
+			m_offMeshOccupancyRefs[hole] = nextKey;
+			m_offMeshOccupancyAgents[hole] = m_offMeshOccupancyAgents[next];
+			hole = next;
+		}
+	}
+}
+
+int dtCrowd::getOffMeshOccupant(dtPolyRef conRef) const
+{
+	if (!conRef || !m_offMeshOccupancyRefs)
+		return -1;
+	const unsigned int start = offMeshOccupancyHash(conRef, m_offMeshOccupancySize);
+	for (int probe = 0; probe < m_offMeshOccupancySize; ++probe)
+	{
+		const unsigned int slot = (start + (unsigned int)probe) % (unsigned int)m_offMeshOccupancySize;
+		const dtPolyRef key = m_offMeshOccupancyRefs[slot];
+		if (key == 0)
+			return -1;
+		if (key == conRef)
+		{
+			const int occupant = m_offMeshOccupancyAgents[slot];
+			const dtCrowdAgent* other = &m_agents[occupant];
+			const dtCrowdAgentAnimation* otherAnim = &m_agentAnims[occupant];
+			if (other->active && other->state != DT_CROWDAGENT_STATE_INVALID && otherAnim->active)
+				return occupant;
+			return -1;
+		}
+	}
+	return -1;
+}
+
+bool dtCrowd::beginOffMeshTraversal(dtCrowdAgent* ag, const int idx, const dtPolyRef conRef)
+{
+	dtCrowdAgentAnimation* anim = &m_agentAnims[idx];
+	const dtNavMesh* nav = m_navquery->getAttachedNavMesh();
+
+	// The connection must still exist and still be an off-mesh connection polygon.
+	const dtOffMeshConnection* con = nav->getOffMeshConnectionByRef(conRef);
+	if (!con)
+		return false;
+
+	const unsigned char conType = getOffMeshConnectionType(nav, conRef);
+	const bool typed = conType != 0;
+
+	// Agent type filter: a typed connection may be refused per agent.
+	if (typed && ag->params.allowedOffMeshTypes != 0 &&
+		(conType & (unsigned char)ag->params.allowedOffMeshTypes) == 0)
+	{
+		return false;
+	}
+
+	// Resolve the traversal direction from the polygon preceding the
+	// connection in the current corridor. The navmesh link graph only exposes
+	// a reverse link for bidirectional connections, but verify explicitly so
+	// a unidirectional connection can never be entered the wrong way even if
+	// the corridor was built against stale data.
+	const dtPolyRef* path = ag->corridor.getPath();
+	const int npath = ag->corridor.getPathCount();
+	dtPolyRef prevRef = 0;
+	for (int i = 0; i < npath; ++i)
+	{
+		if (path[i] == conRef)
+		{
+			if (i > 0)
+				prevRef = path[i-1];
+			break;
+		}
+	}
+	if (!prevRef)
+		return false;
+
+	bool forward = true;
+	{
+		const dtMeshTile* tile = 0;
+		const dtPoly* poly = 0;
+		if (dtStatusFailed(nav->getTileAndPolyByRef(conRef, &tile, &poly)))
+			return false;
+		bool edge0LinkedToPrev = false;
+		for (unsigned int l = poly->firstLink; l != DT_NULL_LINK; l = tile->links[l].next)
+		{
+			if (tile->links[l].edge == 0 && tile->links[l].ref == prevRef)
+			{
+				edge0LinkedToPrev = true;
+				break;
+			}
+		}
+		if (edge0LinkedToPrev)
+		{
+			// Entering through vertex A -> traversal A to B.
+			forward = true;
+		}
+		else
+		{
+			// Entering through vertex B; only legal for bidirectional links.
+			if ((con->flags & DT_OFFMESH_CON_BIDIR) == 0)
+				return false;
+			for (unsigned int l = poly->firstLink; l != DT_NULL_LINK; l = tile->links[l].next)
+			{
+				if (tile->links[l].edge == 1 && tile->links[l].ref == prevRef)
+				{
+					forward = false;
+					break;
+				}
+			}
+		}
+	}
+
+	// Typed connections have exclusive occupancy. Legacy connections retain
+	// their original shared behavior.
+	if (typed)
+	{
+		if (!tryAcquireOffMeshOccupancy(conRef, idx))
+			return false;
+	}
+
+	// Advance the corridor over the connection. This hands the corridor path
+	// to the polygon on the far side and records the connection endpoints in
+	// the animation state.
+	dtPolyRef refs[2];
+	if (!ag->corridor.moveOverOffmeshConnection(conRef, refs, anim->startPos, anim->endPos, m_navquery))
+	{
+		if (typed)
+			releaseOffMeshOccupancy(conRef, idx);
+		return false;
+	}
+	// moveOverOffmeshConnection() returns endpoints oriented A->B regardless
+	// of traversal direction; swap for a reverse traversal so position and
+	// velocity keep the connection's direction semantics.
+	if (!forward)
+	{
+		float tmp[3];
+		dtVcopy(tmp, anim->startPos);
+		dtVcopy(anim->startPos, anim->endPos);
+		dtVcopy(anim->endPos, tmp);
+	}
+
+	// refs[1] is the off-mesh connection polygon itself, which lives in the
+	// same tile as the connection and disappears when that tile streams out.
+	// Resolve the actual ground polygon at the far endpoint now, so recovery
+	// can hand the agent to a polygon that survives the connection's tile.
+	dtPolyRef landRef = 0;
+	float landPos[3];
+	dtVcopy(landPos, anim->endPos);
+	m_navquery->findNearestPoly(anim->endPos, m_agentPlacementHalfExtents,
+							   &m_filters[ag->params.queryFilterType], &landRef, landPos);
+
+	dtVcopy(anim->initPos, ag->npos);
+	anim->polyRef = conRef;
+	anim->prevRef = refs[0];
+	anim->landRef = landRef ? landRef : refs[1];
+	anim->connectionType = conType;
+	anim->forward = forward;
+	anim->occupancyHeld = typed;
+	anim->arrivalNotified = false;
+	anim->t = 0.0f;
+	anim->tmax = (dtVdist2D(anim->startPos, anim->endPos) / ag->params.maxSpeed) * 0.5f;
+	if (anim->tmax <= 0.0f)
+		anim->tmax = 0.0001f;
+	anim->active = true;
+
+	ag->state = DT_CROWDAGENT_STATE_OFFMESH;
+	ag->traversalState = typed ? DT_CROWD_TRAVERSAL_ACTIVE : DT_CROWD_TRAVERSAL_LEGACY;
+	ag->ncorners = 0;
+	ag->nneis = 0;
+	// The corridor target is already on the far side; cancel any in-flight
+	// replan so path results cannot race the traversal state.
+	ag->targetPathqRef = DT_PATHQ_INVALID;
+
+	return true;
+}
+
+bool dtCrowd::recoverOffMeshTraversal(dtCrowdAgent* ag, const int idx)
+{
+	dtCrowdAgentAnimation* anim = &m_agentAnims[idx];
+	const dtQueryFilter* filter = &m_filters[ag->params.queryFilterType];
+
+	// Prefer the landing polygon recorded when the traversal began.
+	dtPolyRef safeRef = anim->landRef;
+	float safePos[3];
+	dtVcopy(safePos, anim->endPos);
+
+	if (!safeRef || !m_navquery->isValidPolyRef(safeRef, filter))
+	{
+		// The far side disappeared (tile stream-out, connection invalidation).
+		// Try the polygon we entered from, at the agent's current position.
+		safeRef = anim->prevRef;
+		dtVcopy(safePos, ag->npos);
+		if (!safeRef || !m_navquery->isValidPolyRef(safeRef, filter))
+		{
+			// Last resort: nearest valid polygon around the agent.
+			safeRef = 0;
+			m_navquery->findNearestPoly(ag->npos, m_agentPlacementHalfExtents, filter, &safeRef, safePos);
+		}
+	}
+
+	if (!safeRef || !m_navquery->isValidPolyRef(safeRef, filter))
+	{
+		// No valid navigation polygon can take over. This is a recognizable,
+		// externally visible stall rather than a silently dropped agent. All
+		// connection-owned resources are still released so no stale reference,
+		// callback or occupancy outlives the dead connection.
+		if (anim->occupancyHeld)
+			releaseOffMeshOccupancy(anim->polyRef, idx);
+		memset(anim, 0, sizeof(dtCrowdAgentAnimation));
+		anim->active = false;
+
+		ag->state = DT_CROWDAGENT_STATE_OFFMESH_STALLED;
+		ag->traversalState = DT_CROWD_TRAVERSAL_STALLED;
+		ag->ncorners = 0;
+		ag->nneis = 0;
+		dtVset(ag->vel, 0,0,0);
+		dtVset(ag->dvel, 0,0,0);
+		dtVset(ag->nvel, 0,0,0);
+		return false;
+	}
+
+	// Hand the agent to the surviving polygon and rebuild a minimal corridor.
+	ag->corridor.reset(safeRef, safePos);
+	ag->boundary.reset();
+	dtVcopy(ag->npos, safePos);
+	dtVset(ag->vel, 0,0,0);
+	dtVset(ag->dvel, 0,0,0);
+	dtVset(ag->nvel, 0,0,0);
+
+	// Release all connection-owned resources before returning to walking.
+	const dtPolyRef staleCon = anim->polyRef;
+	if (anim->occupancyHeld)
+		releaseOffMeshOccupancy(staleCon, idx);
+	memset(anim, 0, sizeof(dtCrowdAgentAnimation));
+	anim->active = false;
+
+	ag->state = DT_CROWDAGENT_STATE_WALKING;
+	ag->traversalState = DT_CROWD_TRAVERSAL_NONE;
+	ag->ncorners = 0;
+	ag->nneis = 0;
+	ag->partial = false;
+
+	// Re-establish a path if the agent still has a live movement target.
+	if (ag->targetState != DT_CROWDAGENT_TARGET_NONE &&
+		ag->targetState != DT_CROWDAGENT_TARGET_VELOCITY &&
+		ag->targetRef &&
+		m_navquery->isValidPolyRef(ag->targetRef, filter))
+	{
+		requestMoveTargetReplan(idx, ag->targetRef, ag->targetPos);
+	}
+	else
+	{
+		ag->targetState = DT_CROWDAGENT_TARGET_NONE;
+	}
+
+	return true;
+}
+
+void dtCrowd::abortOffMeshTraversal(dtCrowdAgent* ag, const int idx, const unsigned char failureState)
+{
+	dtCrowdAgentAnimation* anim = &m_agentAnims[idx];
+	if (anim->occupancyHeld)
+		releaseOffMeshOccupancy(anim->polyRef, idx);
+	memset(anim, 0, sizeof(dtCrowdAgentAnimation));
+	anim->active = false;
+
+	ag->traversalState = failureState;
+	ag->state = DT_CROWDAGENT_STATE_OFFMESH_STALLED;
+	ag->ncorners = 0;
+	ag->nneis = 0;
+	dtVset(ag->vel, 0,0,0);
+	dtVset(ag->dvel, 0,0,0);
+	dtVset(ag->nvel, 0,0,0);
+}
+
+void dtCrowd::finishOffMeshTraversal(dtCrowdAgent* ag, const int idx)
+{
+	dtCrowdAgentAnimation* anim = &m_agentAnims[idx];
+	const dtNavMesh* nav = m_navquery->getAttachedNavMesh();
+
+	// The far side must still be valid; otherwise recover rather than finish.
+	const dtQueryFilter* filter = &m_filters[ag->params.queryFilterType];
+	if (!anim->landRef || !m_navquery->isValidPolyRef(anim->landRef, filter) ||
+		!nav->getOffMeshConnectionByRef(anim->polyRef))
+	{
+		recoverOffMeshTraversal(ag, idx);
+		return;
+	}
+
+	// Settle the agent exactly on the far endpoint and constrain the corridor.
+	float endPos[3];
+	dtVcopy(endPos, anim->endPos);
+	ag->corridor.movePosition(endPos, m_navquery, filter);
+	dtVcopy(ag->npos, ag->corridor.getPos());
+
+	const dtPolyRef completedCon = anim->polyRef;
+	const unsigned char completedType = anim->connectionType;
+	const bool wasTyped = anim->occupancyHeld;
+	const bool alreadyNotified = anim->arrivalNotified;
+
+	if (wasTyped)
+		releaseOffMeshOccupancy(completedCon, idx);
+
+	memset(anim, 0, sizeof(dtCrowdAgentAnimation));
+	anim->active = false;
+
+	ag->state = DT_CROWDAGENT_STATE_WALKING;
+	ag->traversalState = DT_CROWD_TRAVERSAL_NONE;
+	ag->ncorners = 0;
+	ag->nneis = 0;
+	ag->boundary.reset();
+	dtVset(ag->vel, 0,0,0);
+	dtVset(ag->dvel, 0,0,0);
+	dtVset(ag->nvel, 0,0,0);
+
+	if (wasTyped && !alreadyNotified && m_offMeshArrivalCallback)
+	{
+		m_offMeshArrivalCallback(idx, completedCon, completedType, m_offMeshArrivalUserData);
+	}
+}
+
+void dtCrowd::updateOffMeshTraversal(dtCrowdAgent** agents, const int nagents, const float dt)
+{
+	for (int i = 0; i < nagents; ++i)
+	{
+		dtCrowdAgent* ag = agents[i];
+		if (ag->state != DT_CROWDAGENT_STATE_OFFMESH)
+			continue;
+
+		const int idx = getAgentIndex(ag);
+		dtCrowdAgentAnimation* anim = &m_agentAnims[idx];
+		if (!anim->active)
+		{
+			// Defensive: state without an active traversal cannot be driven.
+			abortOffMeshTraversal(ag, idx, DT_CROWD_TRAVERSAL_FAILED);
+			continue;
+		}
+
+		const dtNavMesh* nav = m_navquery->getAttachedNavMesh();
+
+		// The connection (or its tile) may have been invalidated mid-traversal
+		// by a stream-out or mesh edit. Recover before touching its data.
+		if (!nav->getOffMeshConnectionByRef(anim->polyRef) ||
+			(anim->landRef && !m_navquery->isValidPolyRef(anim->landRef, &m_filters[ag->params.queryFilterType])))
+		{
+			if (!recoverOffMeshTraversal(ag, idx))
+			{
+				// recoverOffMeshTraversal already parked the agent in STALLED.
+			}
+			continue;
+		}
+
+		anim->t += dt;
+		if (anim->t >= anim->tmax)
+		{
+			finishOffMeshTraversal(ag, idx);
+			continue;
+		}
+
+		// Position interpolation. Legacy connections keep the historical
+		// two-phase ease; typed connections traverse start->end directly so
+		// their motion follows the connection's full geometric span.
+		if (ag->traversalState == DT_CROWD_TRAVERSAL_LEGACY)
+		{
+			const float ta = anim->tmax*0.15f;
+			const float tb = anim->tmax;
+			if (anim->t < ta)
+			{
+				const float u = tween(anim->t, 0.0f, ta);
+				dtVlerp(ag->npos, anim->initPos, anim->startPos, u);
+			}
+			else
+			{
+				const float u = tween(anim->t, ta, tb);
+				dtVlerp(ag->npos, anim->startPos, anim->endPos, u);
+			}
+			dtVset(ag->vel, 0,0,0);
+			dtVset(ag->dvel, 0,0,0);
+		}
+		else
+		{
+			const float u = tween(anim->t, 0.0f, anim->tmax);
+			dtVlerp(ag->npos, anim->startPos, anim->endPos, u);
+			// Explicit velocity along the traversal direction, so consumers
+			// observe a physically meaningful velocity while on the connection.
+			float dir[3];
+			dtVsub(dir, anim->endPos, anim->startPos);
+			const float len = dtVlen(dir);
+			if (len > 0.00001f)
+			{
+				const float speed = len / anim->tmax;
+				dtVscale(ag->vel, dir, speed/len);
+				dtVcopy(ag->dvel, ag->vel);
+				dtVcopy(ag->nvel, ag->vel);
+			}
+			else
+			{
+				dtVset(ag->vel, 0,0,0);
+				dtVset(ag->dvel, 0,0,0);
+				dtVset(ag->nvel, 0,0,0);
+			}
+		}
+	}
+}
+
 void dtCrowd::update(const float dt, dtCrowdAgentDebugInfo* debug)
 {
 	m_velocitySampleCount = 0;
@@ -1051,6 +1646,45 @@ void dtCrowd::update(const float dt, dtCrowdAgentDebugInfo* debug)
 	
 	dtCrowdAgent** agents = m_activeAgents;
 	int nagents = getActiveAgents(agents, m_maxAgents);
+
+	// Re-attempt recovery for agents parked on an interrupted traversal.
+	// If the navigation mesh became valid again they resume normal corridor
+	// movement; otherwise they remain in the recognizable stalled state.
+	for (int i = 0; i < nagents; ++i)
+	{
+		dtCrowdAgent* ag = agents[i];
+		if (ag->state != DT_CROWDAGENT_STATE_OFFMESH_STALLED)
+			continue;
+		const int idx = getAgentIndex(ag);
+		dtCrowdAgentAnimation* anim = &m_agentAnims[idx];
+		if (anim->active)
+		{
+			// A traversal object still exists; run the full recovery path.
+			recoverOffMeshTraversal(ag, idx);
+		}
+		else
+		{
+			// Aborted traversal: just look for a valid polygon nearby.
+			float nearest[3];
+			dtPolyRef ref = 0;
+			dtVcopy(nearest, ag->npos);
+			m_navquery->findNearestPoly(ag->npos, m_agentPlacementHalfExtents,
+									   &m_filters[ag->params.queryFilterType], &ref, nearest);
+			if (ref)
+			{
+				ag->corridor.reset(ref, nearest);
+				ag->boundary.reset();
+				dtVcopy(ag->npos, nearest);
+				ag->state = DT_CROWDAGENT_STATE_WALKING;
+				ag->traversalState = DT_CROWD_TRAVERSAL_NONE;
+				if (ag->targetState != DT_CROWDAGENT_TARGET_NONE &&
+					ag->targetState != DT_CROWDAGENT_TARGET_VELOCITY && ag->targetRef)
+					requestMoveTargetReplan(idx, ag->targetRef, ag->targetPos);
+				else
+					ag->targetState = DT_CROWDAGENT_TARGET_NONE;
+			}
+		}
+	}
 
 	// Check that all agents still have valid paths.
 	checkPathValidity(agents, nagents, dt);
@@ -1138,40 +1772,32 @@ void dtCrowd::update(const float dt, dtCrowdAgentDebugInfo* debug)
 	for (int i = 0; i < nagents; ++i)
 	{
 		dtCrowdAgent* ag = agents[i];
-		
+
 		if (ag->state != DT_CROWDAGENT_STATE_WALKING)
 			continue;
 		if (ag->targetState == DT_CROWDAGENT_TARGET_NONE || ag->targetState == DT_CROWDAGENT_TARGET_VELOCITY)
 			continue;
-		
-		// Check 
+
+		// Check
 		const float triggerRadius = ag->params.radius*2.25f;
 		if (overOffmeshConnection(ag, triggerRadius))
 		{
-			// Prepare to off-mesh connection.
 			const int idx = (int)(ag - m_agents);
-			dtCrowdAgentAnimation* anim = &m_agentAnims[idx];
-			
-			// Adjust the path over the off-mesh connection.
-			dtPolyRef refs[2];
-			if (ag->corridor.moveOverOffmeshConnection(ag->cornerPolys[ag->ncorners-1], refs,
-													   anim->startPos, anim->endPos, m_navquery))
+			const dtPolyRef conRef = ag->cornerPolys[ag->ncorners-1];
+
+			if (beginOffMeshTraversal(ag, idx, conRef))
 			{
-				dtVcopy(anim->initPos, ag->npos);
-				anim->polyRef = refs[1];
-				anim->active = true;
-				anim->t = 0.0f;
-				anim->tmax = (dtVdist2D(anim->startPos, anim->endPos) / ag->params.maxSpeed) * 0.5f;
-				
-				ag->state = DT_CROWDAGENT_STATE_OFFMESH;
-				ag->ncorners = 0;
-				ag->nneis = 0;
+				// The agent now owns an independent traversal state and will
+				// not return to corridor steering until it leaves the connection.
 				continue;
 			}
-			else
-			{
-				// Path validity check will ensure that bad/blocked connections will be replanned.
-			}
+
+			// Entry rejected: wrong direction on a unidirectional connection,
+			// a disallowed type, or an occupied typed connection. The
+			// connection must never be silently treated as ordinary
+			// reachability, so force a replan that routes around it.
+			if (ag->targetState != DT_CROWDAGENT_TARGET_NONE && ag->targetRef)
+				requestMoveTargetReplan(idx, ag->targetRef, ag->targetPos);
 		}
 	}
 		
@@ -1407,43 +2033,37 @@ void dtCrowd::update(const float dt, dtCrowdAgentDebugInfo* debug)
 
 	}
 	
-	// Update agents using off-mesh connection.
-	for (int i = 0; i < nagents; ++i)
-	{
-		dtCrowdAgent* ag = agents[i];
-		const int idx = (int)(ag - m_agents);
-		dtCrowdAgentAnimation* anim = &m_agentAnims[idx];
-		if (!anim->active)
-			continue;
-		
+	// Advance all off-mesh connection traversals. This owns position,
+	// velocity, occupancy release and the arrival callback until the agent
+	// successfully leaves the connection (or is recovered/aborted).
+	updateOffMeshTraversal(agents, nagents, dt);
 
-		anim->t += dt;
-		if (anim->t > anim->tmax)
-		{
-			// Reset animation
-			anim->active = false;
-			// Prepare agent for walking.
-			ag->state = DT_CROWDAGENT_STATE_WALKING;
-			continue;
-		}
-		
-		// Update position
-		const float ta = anim->tmax*0.15f;
-		const float tb = anim->tmax;
-		if (anim->t < ta)
-		{
-			const float u = tween(anim->t, 0.0, ta);
-			dtVlerp(ag->npos, anim->initPos, anim->startPos, u);
-		}
-		else
-		{
-			const float u = tween(anim->t, ta, tb);
-			dtVlerp(ag->npos, anim->startPos, anim->endPos, u);
-		}
-			
-		// Update velocity.
-		dtVset(ag->vel, 0,0,0);
-		dtVset(ag->dvel, 0,0,0);
-	}
-	
+}
+
+void dtCrowd::setOffMeshConnectionArrivalCallback(dtCrowdOffMeshArrivalCallback callback, void* userData)
+{
+	m_offMeshArrivalCallback = callback;
+	m_offMeshArrivalUserData = userData;
+}
+
+unsigned char dtCrowd::getAgentTraversalState(const int idx) const
+{
+	if (idx < 0 || idx >= m_maxAgents)
+		return DT_CROWD_TRAVERSAL_FAILED;
+	return m_agents[idx].traversalState;
+}
+
+dtPolyRef dtCrowd::getAgentOffMeshConnection(const int idx) const
+{
+	if (idx < 0 || idx >= m_maxAgents)
+		return 0;
+	const dtCrowdAgentAnimation* anim = &m_agentAnims[idx];
+	if (!anim->active)
+		return 0;
+	return anim->polyRef;
+}
+
+int dtCrowd::getOffMeshConnectionOccupant(dtPolyRef conRef) const
+{
+	return getOffMeshOccupant(conRef);
 }

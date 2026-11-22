@@ -66,8 +66,47 @@ enum CrowdAgentState
 {
 	DT_CROWDAGENT_STATE_INVALID,		///< The agent is not in a valid state.
 	DT_CROWDAGENT_STATE_WALKING,		///< The agent is traversing a normal navigation mesh polygon.
-	DT_CROWDAGENT_STATE_OFFMESH 		///< The agent is traversing an off-mesh connection.
+	DT_CROWDAGENT_STATE_OFFMESH,		///< The agent is traversing an off-mesh connection.
+	DT_CROWDAGENT_STATE_OFFMESH_STALLED	///< The agent is stuck on an off-mesh connection whose traversal could not be completed or recovered.
 };
+
+/// User defined off-mesh connection types.
+///
+/// The type is carried by the upper flag bits of the off-mesh connection
+/// polygon (see #dtPoly::flags). The low flag bits (0x01 walkable, 0x02 and
+/// so on) are left to the standard Detour polygon semantics, so a connection
+/// can be both walkable and carry a type. A connection whose type bits are
+/// all zero is considered a legacy, untyped connection and keeps the original
+/// interpolation based traversal behavior.
+/// @ingroup crowd
+enum dtCrowdOffMeshConnectionType
+{
+	DT_CROWD_OFFMESH_TYPE_DOOR = 0x10,		///< A door. Exclusive use while open/traversed.
+	DT_CROWD_OFFMESH_TYPE_JUMP = 0x20,		///< A jump or leap across a gap.
+	DT_CROWD_OFFMESH_TYPE_CLIMB = 0x40,	///< A climb, such as a ladder or ledge.
+	DT_CROWD_OFFMESH_TYPE_ELEVATOR = 0x80,	///< An elevator or moving platform.
+	DT_CROWD_OFFMESH_TYPE_MASK = 0xf0		///< Bit mask covering all defined connection types.
+};
+
+/// The lifecycle state of an agent's off-mesh connection traversal.
+/// @ingroup crowd
+enum dtCrowdTraversalState
+{
+	DT_CROWD_TRAVERSAL_NONE = 0,		///< The agent is not traversing an off-mesh connection.
+	DT_CROWD_TRAVERSAL_ACTIVE,			///< The agent is actively traversing a typed off-mesh connection.
+	DT_CROWD_TRAVERSAL_LEGACY,			///< The agent is traversing an untyped connection using the legacy animation.
+	DT_CROWD_TRAVERSAL_STALLED,			///< The traversal was interrupted and no valid navigation polygon could take over.
+	DT_CROWD_TRAVERSAL_FAILED			///< The traversal failed (invalid connection, wrong direction, blocked type).
+};
+
+/// Callback invoked when an agent successfully completes a typed off-mesh
+/// connection traversal and returns to normal corridor movement.
+/// @ingroup crowd
+/// @see dtCrowd::setOffMeshConnectionArrivalCallback()
+typedef void (*dtCrowdOffMeshArrivalCallback)(const int agentIdx,
+											   const dtPolyRef connectionRef,
+											   const unsigned char connectionType,
+											   void* userData);
 
 /// Configuration parameters for a crowd agent.
 /// @ingroup crowd
@@ -95,6 +134,11 @@ struct dtCrowdAgentParams
 
 	/// The index of the query filter used by this agent.
 	unsigned char queryFilterType;
+
+	/// Bit mask of off-mesh connection types (#dtCrowdOffMeshConnectionType)
+	/// this agent is allowed to traverse. Zero means every typed connection is
+	/// permitted. Untyped (legacy) connections are always permitted.
+	unsigned int allowedOffMeshTypes;
 
 	/// User defined data attached to the agent.
 	void* userData;
@@ -169,14 +213,42 @@ struct dtCrowdAgent
 	dtPathQueueRef targetPathqRef;		///< Path finder ref.
 	bool targetReplan;					///< Flag indicating that the current path is being replanned.
 	float targetReplanTime;				/// <Time since the agent's target was replanned.
+
+	/// State of the current off-mesh connection traversal. (See: #dtCrowdTraversalState)
+	unsigned char traversalState;
 };
 
+/// Per-agent off-mesh connection traversal state.
+///
+/// While the owning agent is in #DT_CROWDAGENT_STATE_OFFMESH or
+/// #DT_CROWDAGENT_STATE_OFFMESH_STALLED, this structure records every piece
+/// of information needed to deterministically complete or abort the traversal
+/// without leaving stale connection references, callbacks or occupancy behind.
 struct dtCrowdAgentAnimation
 {
 	bool active;
 	float initPos[3], startPos[3], endPos[3];
-	dtPolyRef polyRef;
+	dtPolyRef polyRef;					///< The off-mesh connection polygon reference.
 	float t, tmax;
+
+	/// The polygon the agent was walking on when entering the connection.
+	dtPolyRef prevRef;
+
+	/// The navigation polygon the agent must be handed to when leaving the connection.
+	dtPolyRef landRef;
+
+	/// Connection type as carried by the connection polygon flags. Zero for legacy, untyped connections.
+	unsigned char connectionType;
+
+	/// Traversal direction. True when following the connection from endpoint A to B,
+	/// false for the reverse direction of a bidirectional connection.
+	bool forward;
+
+	/// True when the crowd currently holds an exclusive occupancy slot for the connection.
+	bool occupancyHeld;
+
+	/// True once the arrival callback has been invoked, guarding against duplicate calls.
+	bool arrivalNotified;
 };
 
 /// Crowd agent update flags.
@@ -206,7 +278,18 @@ class dtCrowd
 	dtCrowdAgent* m_agents;
 	dtCrowdAgent** m_activeAgents;
 	dtCrowdAgentAnimation* m_agentAnims;
-	
+
+	/// Deterministic occupancy table for typed off-mesh connections.
+	/// Open addressing keyed by the connection polygon reference; the parallel
+	/// agent array records the occupying agent index. A zero key marks an empty slot.
+	dtPolyRef* m_offMeshOccupancyRefs;
+	int* m_offMeshOccupancyAgents;
+	int m_offMeshOccupancySize;
+
+	/// Arrival callback invoked after a successful typed connection traversal.
+	dtCrowdOffMeshArrivalCallback m_offMeshArrivalCallback;
+	void* m_offMeshArrivalUserData;
+
 	dtPathQueue m_pathq;
 
 	dtObstacleAvoidanceParams m_obstacleQueryParams[DT_CROWD_MAX_OBSTAVOIDANCE_PARAMS];
@@ -230,6 +313,16 @@ class dtCrowd
 	void updateTopologyOptimization(dtCrowdAgent** agents, const int nagents, const float dt);
 	void updateMoveRequest(const float dt);
 	void checkPathValidity(dtCrowdAgent** agents, const int nagents, const float dt);
+
+	// Typed off-mesh connection traversal helpers.
+	bool tryAcquireOffMeshOccupancy(dtPolyRef conRef, const int agentIdx);
+	void releaseOffMeshOccupancy(dtPolyRef conRef, const int agentIdx);
+	int getOffMeshOccupant(dtPolyRef conRef) const;
+	bool beginOffMeshTraversal(dtCrowdAgent* ag, const int idx, const dtPolyRef conRef);
+	void updateOffMeshTraversal(dtCrowdAgent** agents, const int nagents, const float dt);
+	bool recoverOffMeshTraversal(dtCrowdAgent* ag, const int idx);
+	void abortOffMeshTraversal(dtCrowdAgent* ag, const int idx, const unsigned char failureState);
+	void finishOffMeshTraversal(dtCrowdAgent* ag, const int idx);
 
 	inline int getAgentIndex(const dtCrowdAgent* agent) const  { return (int)(agent - m_agents); }
 
@@ -347,6 +440,28 @@ public:
 
 	/// Gets the query object used by the crowd.
 	const dtNavMeshQuery* getNavMeshQuery() const { return m_navquery; }
+
+	/// Sets the callback invoked whenever an agent successfully completes a
+	/// typed off-mesh connection traversal.
+	///  @param[in]		callback	The callback, or null to clear it.
+	///  @param[in]		userData	Opaque pointer forwarded to the callback.
+	void setOffMeshConnectionArrivalCallback(dtCrowdOffMeshArrivalCallback callback, void* userData = 0);
+
+	/// Returns the current traversal state of the specified agent.
+	/// (See: #dtCrowdTraversalState)
+	///  @param[in]		idx		The agent index. [Limits: 0 <= value < #getAgentCount()]
+	unsigned char getAgentTraversalState(const int idx) const;
+
+	/// Returns the off-mesh connection reference the specified agent is
+	/// traversing, or zero if the agent is not on a connection.
+	///  @param[in]		idx		The agent index. [Limits: 0 <= value < #getAgentCount()]
+	dtPolyRef getAgentOffMeshConnection(const int idx) const;
+
+	/// Returns the index of the agent currently occupying the specified typed
+	/// off-mesh connection, or -1 if the connection is not occupied or is not
+	/// a typed connection.
+	///  @param[in]		conRef	The off-mesh connection polygon reference.
+	int getOffMeshConnectionOccupant(dtPolyRef conRef) const;
 
 private:
 	// Explicitly disabled copy constructor and copy assignment operator.
