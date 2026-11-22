@@ -17,6 +17,7 @@
 //
 
 #include <float.h>
+#include <limits.h>
 #include <string.h>
 #include "DetourNavMeshQuery.h"
 #include "DetourNavMesh.h"
@@ -1161,6 +1162,272 @@ dtStatus dtNavMeshQuery::findPath(dtPolyRef startRef, dtPolyRef endRef,
 	if (outOfNodes)
 		status |= DT_OUT_OF_NODES;
 	
+	return status;
+}
+
+/// @par
+///
+/// A single Dijkstra search (no heuristic) is run from the start polygon and
+/// every candidate target is evaluated against the same explored graph, so the
+/// common part of the search is explored only once. The open list is ordered by
+/// accumulated traversal cost only; when a node is popped its stored cost is the
+/// exact minimum cost to reach its polygon. When a popped polygon is one of the
+/// candidates, the cost from its last traversed edge to the target position is
+/// added to obtain the full path cost.
+///
+/// The search stops once the cheapest open node is strictly more expensive than
+/// the best complete candidate, which proves that no cheaper candidate remains.
+/// Nodes tied with the best candidate are still processed so that candidates
+/// with identical full cost are resolved by their position in the
+/// @p targetRefs array (lowest index first), making the result deterministic.
+///
+namespace
+{
+	// Returns the lowest input index of a valid target whose reference is ref,
+	// or -1 if ref is not a candidate. Scanning in input order means duplicate
+	// references resolve to their first occurrence.
+	int findTargetIndex(const dtPolyRef* targetRefs, const int* validTargets,
+						const int validCount, const dtPolyRef ref)
+	{
+		for (int i = 0; i < validCount; ++i)
+		{
+			const int idx = validTargets[i];
+			if (targetRefs[idx] == ref)
+				return idx;
+		}
+		return -1;
+	}
+}
+
+dtStatus dtNavMeshQuery::findNearestReachablePoly(dtPolyRef startRef, const float* startPos,
+												  const dtPolyRef* targetRefs, const float* targetPositions,
+												  const int targetCount, const dtQueryFilter* filter,
+												  int* nearestIndex,
+												  dtPolyRef* path, int* pathCount, const int maxPath,
+												  float* nearestCost) const
+{
+	dtAssert(m_nav);
+	dtAssert(m_nodePool);
+	dtAssert(m_openList);
+
+	if (!nearestIndex)
+		return DT_FAILURE | DT_INVALID_PARAM;
+
+	*nearestIndex = -1;
+	if (pathCount)
+		*pathCount = 0;
+
+	// Validate input.
+	if (!m_nav->isValidPolyRef(startRef) ||
+		!startPos || !dtVisfinite(startPos) ||
+		!targetRefs || !targetPositions || targetCount <= 0 ||
+		!filter || (path && maxPath <= 0))
+	{
+		return DT_FAILURE | DT_INVALID_PARAM;
+	}
+
+	// Keep only targets that are valid polygon references, hold finite positions
+	// and pass the filter; an unreachable but otherwise valid target is still
+	// kept here and simply never reached by the search.
+	int* validTargets = static_cast<int*>(dtAlloc(sizeof(int) * targetCount, DT_ALLOC_TEMP));
+	if (!validTargets)
+		return DT_FAILURE | DT_OUT_OF_MEMORY;
+
+	int validCount = 0;
+	for (int i = 0; i < targetCount; ++i)
+	{
+		const dtPolyRef ref = targetRefs[i];
+		if (!m_nav->isValidPolyRef(ref) || !dtVisfinite(&targetPositions[i * 3]))
+			continue;
+
+		const dtMeshTile* targetTile = 0;
+		const dtPoly* targetPoly = 0;
+		m_nav->getTileAndPolyByRefUnsafe(ref, &targetTile, &targetPoly);
+		if (!filter->passFilter(ref, targetTile, targetPoly))
+			continue;
+
+		validTargets[validCount++] = i;
+	}
+
+	dtStatus status = DT_SUCCESS;
+
+	if (validCount == 0)
+	{
+		// No candidate can possibly be reached.
+		dtFree(validTargets);
+		return DT_SUCCESS | DT_PARTIAL_RESULT;
+	}
+
+	m_nodePool->clear();
+	m_openList->clear();
+
+	dtNode* startNode = m_nodePool->getNode(startRef);
+	dtVcopy(startNode->pos, startPos);
+	startNode->pidx = 0;
+	startNode->cost = 0;
+	startNode->total = 0;
+	startNode->id = startRef;
+	startNode->flags = DT_NODE_OPEN;
+	m_openList->push(startNode);
+
+	bool outOfNodes = false;
+	dtNode* bestNode = 0;
+	int bestTarget = INT_MAX;
+	float bestFullCost = FLT_MAX;
+
+	while (!m_openList->empty())
+	{
+		// Every remaining open node already costs more than bestFullCost to
+		// reach, and any complete target adds a non-negative end cost on top of
+		// it. A strictly cheaper candidate can therefore no longer exist. Nodes
+		// whose node cost equals bestFullCost must still be popped because they
+		// can be equal-cost candidates that win the input-order tie-break.
+		if (bestNode && m_openList->top()->total > bestFullCost)
+			break;
+
+		// Remove node from open list and put it in closed list.
+		dtNode* curNode = m_openList->pop();
+		curNode->flags &= ~DT_NODE_OPEN;
+		curNode->flags |= DT_NODE_CLOSED;
+
+		// Get current poly and tile.
+		// The API input has been checked already, skip checking internal data.
+		const dtPolyRef curRef = curNode->id;
+		const dtMeshTile* curTile = 0;
+		const dtPoly* curPoly = 0;
+		m_nav->getTileAndPolyByRefUnsafe(curRef, &curTile, &curPoly);
+
+		// Get parent poly and tile.
+		dtPolyRef parentRef = 0;
+		const dtMeshTile* parentTile = 0;
+		const dtPoly* parentPoly = 0;
+		if (curNode->pidx)
+			parentRef = m_nodePool->getNodeAtIdx(curNode->pidx)->id;
+		if (parentRef)
+			m_nav->getTileAndPolyByRefUnsafe(parentRef, &parentTile, &parentPoly);
+
+		// If this polygon is a candidate, complete its cost with the segment from
+		// the last edge midpoint to the target position, mirroring the end-cost
+		// accounting used by findPath().
+		const int targetIdx = findTargetIndex(targetRefs, validTargets, validCount, curRef);
+		if (targetIdx != -1)
+		{
+			const float* targetPos = &targetPositions[targetIdx * 3];
+			const float endCost = filter->getCost(curNode->pos, targetPos,
+												  parentRef, parentTile, parentPoly,
+												  curRef, curTile, curPoly,
+												  0, 0, 0);
+			const float fullCost = curNode->total + endCost;
+
+			// Candidates are ranked lexicographically by (full cost, input index):
+			// equal costs always resolve to the candidate that appeared first in
+			// the targetRefs array, independently of heap pop order. Duplicate
+			// references are reduced to their first occurrence by the target
+			// lookup above.
+			if (fullCost < bestFullCost ||
+				(fullCost == bestFullCost && targetIdx < bestTarget))
+			{
+				bestFullCost = fullCost;
+				bestNode = curNode;
+				bestTarget = targetIdx;
+			}
+		}
+
+		for (unsigned int i = curPoly->firstLink; i != DT_NULL_LINK; i = curTile->links[i].next)
+		{
+			dtPolyRef neighbourRef = curTile->links[i].ref;
+
+			// Skip invalid ids and do not expand back to where we came from.
+			if (!neighbourRef || neighbourRef == parentRef)
+				continue;
+
+			// Get neighbour poly and tile.
+			// The API input has been checked already, skip checking internal data.
+			const dtMeshTile* neighbourTile = 0;
+			const dtPoly* neighbourPoly = 0;
+			m_nav->getTileAndPolyByRefUnsafe(neighbourRef, &neighbourTile, &neighbourPoly);
+
+			if (!filter->passFilter(neighbourRef, neighbourTile, neighbourPoly))
+				continue;
+
+			// Deal explicitly with crossing tile boundaries.
+			unsigned char crossSide = 0;
+			if (curTile->links[i].side != 0xff)
+				crossSide = curTile->links[i].side >> 1;
+
+			// Get the node.
+			dtNode* neighbourNode = m_nodePool->getNode(neighbourRef, crossSide);
+			if (!neighbourNode)
+			{
+				outOfNodes = true;
+				continue;
+			}
+
+			// If the node is visited the first time, calculate node position.
+			if (neighbourNode->flags == 0)
+			{
+				getEdgeMidPoint(curRef, curPoly, curTile,
+								neighbourRef, neighbourPoly, neighbourTile,
+								neighbourNode->pos);
+			}
+
+			// Accumulated cost up to the neighbour polygon edge midpoint. No
+			// heuristic is used, so node->total is the true minimum cost once the
+			// node has been popped from the open list.
+			const float curCost = filter->getCost(curNode->pos, neighbourNode->pos,
+												  parentRef, parentTile, parentPoly,
+												  curRef, curTile, curPoly,
+												  neighbourRef, neighbourTile, neighbourPoly);
+			const float total = curNode->total + curCost;
+
+			// The node is already in open list and the new result is worse, skip.
+			if ((neighbourNode->flags & DT_NODE_OPEN) && total >= neighbourNode->total)
+				continue;
+			// The node is already visited and processed, and the new result is worse, skip.
+			if ((neighbourNode->flags & DT_NODE_CLOSED) && total >= neighbourNode->total)
+				continue;
+
+			// Add or update the node.
+			neighbourNode->pidx = m_nodePool->getNodeIdx(curNode);
+			neighbourNode->id = neighbourRef;
+			neighbourNode->flags = (neighbourNode->flags & ~DT_NODE_CLOSED);
+			neighbourNode->cost = curCost;
+			neighbourNode->total = total;
+
+			if (neighbourNode->flags & DT_NODE_OPEN)
+			{
+				// Already in open, update node location.
+				m_openList->modify(neighbourNode);
+			}
+			else
+			{
+				// Put the node in open list.
+				neighbourNode->flags |= DT_NODE_OPEN;
+				m_openList->push(neighbourNode);
+			}
+		}
+	}
+
+	dtFree(validTargets);
+
+	if (!bestNode)
+	{
+		// None of the candidate targets is reachable from the start polygon.
+		if (outOfNodes)
+			status |= DT_OUT_OF_NODES;
+		return status | DT_PARTIAL_RESULT;
+	}
+
+	*nearestIndex = bestTarget;
+	if (nearestCost)
+		*nearestCost = bestFullCost;
+
+	if (path && pathCount)
+		status |= getPathToNode(bestNode, path, pathCount, maxPath);
+
+	if (outOfNodes)
+		status |= DT_OUT_OF_NODES;
+
 	return status;
 }
 

@@ -192,6 +192,61 @@ public:
 					  const dtQueryFilter* filter,
 					  dtPolyRef* path, int* pathCount, const int maxPath) const;
 
+	/// Finds the nearest reachable polygon out of a set of candidate target polygons.
+	///
+	/// The search starts from @p startRef and evaluates every polygon in
+	/// @p targetRefs in a single Dijkstra search, so the cost of the common part of
+	/// the search is paid only once. A target polygon is only considered reachable
+	/// if it is connected to the start polygon through polygons that pass the
+	/// @p filter. Target references that are invalid or do not pass the filter are
+	/// skipped.
+	///
+	/// The cost of reaching a target is the polygon-to-polygon traversal cost plus
+	/// the cost from the last polygon edge to the target position, using the same
+	/// cost accounting as findPath(). This makes the reported cost directly
+	/// comparable between candidates and consistent with the cost of a path found
+	/// by findPath() to the same target.
+	///
+	/// If several candidates have the same total cost, the one that appears first
+	/// in the @p targetRefs array is selected. This tie-break makes the result
+	/// deterministic.
+	///
+	///  @param[in]		startRef		The reference id of the start polygon.
+	///  @param[in]		startPos		A position within the start polygon. [(x, y, z)]
+	///  @param[in]		targetRefs		The candidate target polygon reference ids.
+	///  								Duplicate references are allowed.
+	///  @param[in]		targetPositions	Positions within the target polygons, one
+	///  								(x, y, z) triple per entry in @p targetRefs.
+	///  @param[in]		targetCount		The number of entries in @p targetRefs and
+	///  								@p targetPositions. [Limit: >= 1]
+	///  @param[in]		filter			The polygon filter to apply to the query.
+	///  @param[out]	nearestIndex	Index into @p targetRefs of the selected
+	///  								target, or -1 if none of the targets is
+	///  								reachable.
+	///  @param[out]	path			An ordered list of polygon references
+	///  								representing the path to the selected target.
+	///  								(Start to end.) [opt]
+	///  								[(polyRef) * @p pathCount]
+	///  @param[out]	pathCount		The number of polygons returned in the
+	///  								@p path array. Set to 0 when no target is
+	///  								reachable. [opt]
+	///  @param[in]		maxPath			The maximum number of polygons the @p path
+	///  								array can hold. [Limit: >= 1 when @p path is
+	///  								not null]
+	///  @param[out]	nearestCost		The total cost to the selected target.
+	///  								Unchanged when no target is reachable. [opt]
+	/// @returns The status flags for the query. If no candidate is reachable the
+	///  		 result carries the #DT_PARTIAL_RESULT detail flag and
+	///  		 @p nearestIndex is set to -1. #DT_OUT_OF_NODES is set if the node
+	///  		 pool was exhausted before the search completed and
+	///  		 #DT_BUFFER_TOO_SMALL if the path array cannot hold the full path.
+	dtStatus findNearestReachablePoly(dtPolyRef startRef, const float* startPos,
+									  const dtPolyRef* targetRefs, const float* targetPositions,
+									  const int targetCount, const dtQueryFilter* filter,
+									  int* nearestIndex,
+									  dtPolyRef* path, int* pathCount, const int maxPath,
+									  float* nearestCost) const;
+
 	/// Finds the straight path from the start to the end position within the polygon corridor.
 	///  @param[in]		startPos			Path start position. [(x, y, z)]
 	///  @param[in]		endPos				Path end position. [(x, y, z)]
