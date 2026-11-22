@@ -1,3 +1,5 @@
+#include <limits>
+
 #include "Recast.h"
 #include "catch2/catch_amalgamated.hpp"
 
@@ -559,34 +561,105 @@ TEST_CASE("rcRasterizeTriangle", "[recast][rasterization]")
 
 	SECTION("Degenerate triangles rasterize to nothing")
 	{
-		SKIP("Currently Recast rasterizes degenerate triangles as if they were a line or point of non-zero volume.");
+		auto expectNoSpans = [&]()
+		{
+			for (int x = 0; x < xSize; x++)
+			{
+				for (int z = 0; z < zSize; z++)
+				{
+					REQUIRE(hf.spans[x + z * hf.width] == nullptr);
+				}
+			}
+		};
+
 		{ // Co-linear points
 			float v0[] = {1.0f, 0.0f, 0.5f};
 			float v1[] = {2.0f, 0.0f, 0.5f};
 			float v2[] = {4.0f, 0.0f, 0.5f};
 			REQUIRE(rcRasterizeTriangle(&ctx, v0, v1, v2, RC_WALKABLE_AREA, hf, 1));
-
-			// Check that no spans were added
-			for (int x = 0; x < xSize; x++)
-			{
-				for (int z = 0; z < zSize; z++)
-				{
-					rcSpan* span = hf.spans[x + z * hf.width];
-					REQUIRE(span == nullptr);
-				}
-			}
+			expectNoSpans();
 		}
 
 		{ // All vertices are the same point
 			float v0[] = {0.5f, 0.0f, 0.5f};
 			REQUIRE(rcRasterizeTriangle(&ctx, v0, v0, v0, RC_WALKABLE_AREA, hf, 1));
+			expectNoSpans();
+		}
 
-			// Check that no spans were added
-			for (int x = 0; x < xSize; x++)
+		{ // Two coincident vertices, zero area
+			float v0[] = {0.5f, 0.0f, 0.5f};
+			float v1[] = {0.5f, 0.0f, 0.5f};
+			float v2[] = {3.5f, 0.0f, 0.5f};
+			REQUIRE(rcRasterizeTriangle(&ctx, v0, v1, v2, RC_WALKABLE_AREA, hf, 1));
+			expectNoSpans();
+		}
+
+		{ // Vertical sliver with an extremely short base
+			float v0[] = {1.0f, 0.0f, 1.0f};
+			float v1[] = {1.0f + 1e-8f, 0.0f, 1.0f};
+			float v2[] = {1.0f, 3.0f, 1.0f};
+			REQUIRE(rcRasterizeTriangle(&ctx, v0, v1, v2, RC_WALKABLE_AREA, hf, 1));
+			expectNoSpans();
+		}
+
+		{ // Non-finite coordinates
+			float v0[] = {0.0f, 0.0f, 0.0f};
+			float v1[] = {2.0f, 0.0f, 0.0f};
+			float v2[] = {0.0f, std::numeric_limits<float>::quiet_NaN(), 2.0f};
+			REQUIRE(rcRasterizeTriangle(&ctx, v0, v1, v2, RC_WALKABLE_AREA, hf, 1));
+			expectNoSpans();
+
+			float w2[] = {0.0f, std::numeric_limits<float>::infinity(), 2.0f};
+			REQUIRE(rcRasterizeTriangle(&ctx, v0, v1, w2, RC_WALKABLE_AREA, hf, 1));
+			expectNoSpans();
+		}
+
+		{ // Huge but finite coordinates
+			float v0[] = {0.0f, 0.0f, 0.0f};
+			float v1[] = {3.0e38f, 0.0f, 0.0f};
+			float v2[] = {0.0f, 3.0e38f, 0.0f};
+			REQUIRE(rcRasterizeTriangle(&ctx, v0, v1, v2, RC_WALKABLE_AREA, hf, 1));
+			expectNoSpans();
+		}
+	}
+
+	SECTION("Degenerate triangles do not disturb a valid triangle sharing the same cells")
+	{
+		// The valid triangle below covers cells (0,0), (0,1) and (1,0).
+		float valid0[] = {0.0f, 0.0f, 0.0f};
+		float valid1[] = {2.0f, 0.0f, 0.0f};
+		float valid2[] = {0.0f, 0.0f, 2.0f};
+		REQUIRE(rcRasterizeTriangle(&ctx, valid0, valid1, valid2, RC_WALKABLE_AREA, hf, 1));
+
+		// Overlapping degenerates of every shape, at heights that would otherwise
+		// create extra spans or walkable flags.
+		{
+			float v0[] = {0.0f, 0.5f, 0.0f};
+			float v1[] = {1.0f, 0.5f, 0.0f};
+			float v2[] = {2.0f, 0.5f, 0.0f};
+			REQUIRE(rcRasterizeTriangle(&ctx, v0, v1, v2, RC_WALKABLE_AREA, hf, 1));
+
+			float n0[] = {0.0f, 0.0f, 0.0f};
+			float n1[] = {1.0f, 0.0f, 0.0f};
+			float n2[] = {0.0f, std::numeric_limits<float>::quiet_NaN(), 1.0f};
+			REQUIRE(rcRasterizeTriangle(&ctx, n0, n1, n2, RC_WALKABLE_AREA, hf, 1));
+		}
+
+		for (int x = 0; x < xSize; x++)
+		{
+			for (int z = 0; z < zSize; z++)
 			{
-				for (int z = 0; z < zSize; z++)
+				rcSpan* span = hf.spans[x + z * hf.width];
+				if ((x == 0 && z == 0) || (x == 0 && z == 1) || (x == 1 && z == 0))
 				{
-					rcSpan* span = hf.spans[x + z * hf.width];
+					REQUIRE(span != nullptr);
+					REQUIRE(span->smin == 0);
+					REQUIRE(span->smax == 1);
+					REQUIRE(span->area == RC_WALKABLE_AREA);
+					REQUIRE(span->next == nullptr);
+				}
+				else
+				{
 					REQUIRE(span == nullptr);
 				}
 			}
@@ -608,6 +681,290 @@ TEST_CASE("rcRasterizeTriangle", "[recast][rasterization]")
 			{
 				REQUIRE(hf.spans[x + z * hf.width] == nullptr);
 			}
+		}
+	}
+}
+
+TEST_CASE("rcRasterizeTriangles rejects malformed index data", "[recast][rasterization][degenerate]")
+{
+	rcContext ctx(false);
+
+	constexpr int xSize = 5;
+	constexpr int zSize = 5;
+	constexpr float cellSize = 1.0f;
+	constexpr float cellHeight = 1.0f;
+	const float minBounds[3] = {0.0f, 0.0f, 0.0f};
+	const float maxBounds[3] = {cellSize * xSize, cellHeight * xSize, cellSize * zSize};
+
+	rcHeightfield hf;
+	REQUIRE(rcCreateHeightfield(&ctx, hf, xSize, zSize, minBounds, maxBounds, cellSize, cellHeight));
+
+	const float verts[] = {
+		0.0f, 0.0f, 0.0f,
+		2.0f, 0.0f, 0.0f,
+		0.0f, 0.0f, 2.0f,
+	};
+	const int numVerts = 3;
+	const unsigned char areas[] = {RC_WALKABLE_AREA, RC_WALKABLE_AREA};
+
+	SECTION("Out of range vertex indices are skipped")
+	{
+		const int tris[] = {
+			0, 1, 2,
+			0, 1, 99,
+		};
+		REQUIRE(rcRasterizeTriangles(&ctx, verts, numVerts, tris, areas, 2, hf, 1));
+
+		// Only the valid triangle contributed spans.
+		REQUIRE(hf.spans[0 + 0 * xSize] != nullptr);
+		REQUIRE(hf.spans[0 + 1 * xSize] != nullptr);
+		REQUIRE(hf.spans[1 + 0 * xSize] != nullptr);
+	}
+
+	SECTION("Negative vertex indices are skipped")
+	{
+		const int tris[] = { -1, 1, 2 };
+		REQUIRE(rcRasterizeTriangles(&ctx, verts, numVerts, tris, areas, 1, hf, 1));
+		for (int x = 0; x < xSize; ++x)
+			for (int z = 0; z < zSize; ++z)
+				REQUIRE(hf.spans[x + z * xSize] == nullptr);
+	}
+
+	SECTION("A negative triangle count is rejected")
+	{
+		const int tris[] = { 0, 1, 2 };
+		REQUIRE(!rcRasterizeTriangles(&ctx, verts, numVerts, tris, areas, -1, hf, 1));
+	}
+
+	SECTION("A null index array with triangles is rejected")
+	{
+		REQUIRE(!rcRasterizeTriangles(&ctx, verts, numVerts, static_cast<const int*>(nullptr), areas, 1, hf, 1));
+	}
+
+	SECTION("A zero triangle count succeeds and adds nothing")
+	{
+		REQUIRE(rcRasterizeTriangles(&ctx, verts, numVerts, static_cast<const int*>(nullptr), areas, 0, hf, 1));
+	}
+}
+
+TEST_CASE("rcAddSpan rejects out of bounds columns", "[recast][rasterization][degenerate]")
+{
+	rcContext ctx(false);
+
+	constexpr int xSize = 4;
+	constexpr int zSize = 4;
+	const float minBounds[3] = {0.0f, 0.0f, 0.0f};
+	const float maxBounds[3] = {4.0f, 10.0f, 4.0f};
+
+	rcHeightfield hf;
+	REQUIRE(rcCreateHeightfield(&ctx, hf, xSize, zSize, minBounds, maxBounds, 1.0f, 2.0f));
+
+	// Negative and too-large coordinates must be ignored, not written.
+	REQUIRE(rcAddSpan(&ctx, hf, -1, 0, 0, 1, 42, 1));
+	REQUIRE(rcAddSpan(&ctx, hf, 0, -1, 0, 1, 42, 1));
+	REQUIRE(rcAddSpan(&ctx, hf, xSize, 0, 0, 1, 42, 1));
+	REQUIRE(rcAddSpan(&ctx, hf, 0, zSize, 0, 1, 42, 1));
+
+	for (int i = 0; i < xSize * zSize; ++i)
+	{
+		REQUIRE(hf.spans[i] == nullptr);
+	}
+
+	// In bounds still works.
+	REQUIRE(rcAddSpan(&ctx, hf, 0, 0, 0, 1, 42, 1));
+	REQUIRE(hf.spans[0] != nullptr);
+}
+
+TEST_CASE("rcRasterizeTriangle handles an empty heightfield", "[recast][rasterization][degenerate]")
+{
+	rcContext ctx(false);
+
+	const float minBounds[3] = {0.0f, 0.0f, 0.0f};
+	const float maxBounds[3] = {0.0f, 0.0f, 0.0f};
+
+	rcHeightfield hf;
+	REQUIRE(rcCreateHeightfield(&ctx, hf, 0, 0, minBounds, maxBounds, 1.0f, 1.0f));
+
+	const float v0[] = {0.0f, 0.0f, 0.0f};
+	const float v1[] = {2.0f, 0.0f, 0.0f};
+	const float v2[] = {0.0f, 0.0f, 2.0f};
+
+	// No grid to write into; the call must succeed without touching memory.
+	REQUIRE(rcRasterizeTriangle(&ctx, v0, v1, v2, RC_WALKABLE_AREA, hf, 1));
+}
+
+TEST_CASE("Rasterization is consistent across tile boundaries", "[recast][rasterization][degenerate]")
+{
+	// A triangle spanning a boundary between two tiles, together with a
+	// degenerate triangle sitting exactly on that boundary. Rasterizing the
+	// whole span at once must produce the same spikes as rasterizing each tile
+	// separately with the same triangle set.
+	rcContext ctx(false);
+
+	constexpr float cellSize = 1.0f;
+	constexpr float cellHeight = 1.0f;
+
+	const float tile0Min[3] = {0.0f, 0.0f, 0.0f};
+	const float tile0Max[3] = {8.0f, 8.0f, 8.0f};
+	const float tile1Min[3] = {8.0f, 0.0f, 0.0f};
+	const float tile1Max[3] = {16.0f, 8.0f, 8.0f};
+
+	const float v0[] = {6.0f, 0.0f, 2.0f};
+	const float v1[] = {10.0f, 0.0f, 2.0f};
+	const float v2[] = {8.0f, 0.0f, 6.0f};
+
+	const float d0[] = {8.0f, 0.0f, 0.0f};
+	const float d1[] = {8.0f, 0.0f, 8.0f};
+
+	auto rasterizeInto = [&](rcHeightfield& hf)
+	{
+		REQUIRE(rcRasterizeTriangle(&ctx, v0, v1, v2, RC_WALKABLE_AREA, hf, 1));
+		REQUIRE(rcRasterizeTriangle(&ctx, d0, d0, d1, RC_WALKABLE_AREA, hf, 1));
+	};
+
+	rcHeightfield whole;
+	REQUIRE(rcCreateHeightfield(&ctx, whole, 16, 8, tile0Min, tile1Max, cellSize, cellHeight));
+	rasterizeInto(whole);
+
+	rcHeightfield t0, t1;
+	REQUIRE(rcCreateHeightfield(&ctx, t0, 8, 8, tile0Min, tile0Max, cellSize, cellHeight));
+	REQUIRE(rcCreateHeightfield(&ctx, t1, 8, 8, tile1Min, tile1Max, cellSize, cellHeight));
+	rasterizeInto(t0);
+	rasterizeInto(t1);
+
+	// Compare the overlapping columns.
+	for (int z = 0; z < 8; ++z)
+	{
+		for (int x = 0; x < 8; ++x)
+		{
+			const rcSpan* a = whole.spans[x + z * whole.width];
+			const rcSpan* b = t0.spans[x + z * t0.width];
+			REQUIRE((a == nullptr) == (b == nullptr));
+			if (a && b)
+			{
+				REQUIRE(a->smin == b->smin);
+				REQUIRE(a->smax == b->smax);
+				REQUIRE(a->area == b->area);
+			}
+
+			const rcSpan* c = whole.spans[(x + 8) + z * whole.width];
+			const rcSpan* d = t1.spans[x + z * t1.width];
+			REQUIRE((c == nullptr) == (d == nullptr));
+			if (c && d)
+			{
+				REQUIRE(c->smin == d->smin);
+				REQUIRE(c->smax == d->smax);
+				REQUIRE(c->area == d->area);
+			}
+		}
+	}
+}
+
+TEST_CASE("Repeated rasterization into a fresh heightfield is identical", "[recast][rasterization][degenerate]")
+{
+	rcContext ctx(false);
+
+	constexpr int xSize = 8;
+	constexpr int zSize = 8;
+	const float minBounds[3] = {0.0f, 0.0f, 0.0f};
+	const float maxBounds[3] = {8.0f, 8.0f, 8.0f};
+
+	const float verts[] = {
+		0.0f, 0.0f, 0.0f,
+		4.0f, 0.0f, 0.0f,
+		0.0f, 0.0f, 4.0f,
+		2.0f, 0.0f, 2.0f, // collinear helper
+		std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f,
+	};
+	const int tris[] = {
+		0, 1, 2,
+		0, 1, 3, // collinear
+		0, 1, 4, // non-finite
+	};
+	const unsigned char areas[] = {RC_WALKABLE_AREA, RC_WALKABLE_AREA, RC_WALKABLE_AREA};
+
+	auto build = [&](rcHeightfield& hf)
+	{
+		REQUIRE(rcCreateHeightfield(&ctx, hf, xSize, zSize, minBounds, maxBounds, 1.0f, 1.0f));
+		REQUIRE(rcRasterizeTriangles(&ctx, verts, 5, tris, areas, 3, hf, 1));
+	};
+
+	rcHeightfield first, second;
+	build(first);
+	build(second);
+
+	for (int i = 0; i < xSize * zSize; ++i)
+	{
+		const rcSpan* a = first.spans[i];
+		const rcSpan* b = second.spans[i];
+		REQUIRE((a == nullptr) == (b == nullptr));
+		while (a && b)
+		{
+			REQUIRE(a->smin == b->smin);
+			REQUIRE(a->smax == b->smax);
+			REQUIRE(a->area == b->area);
+			a = a->next;
+			b = b->next;
+		}
+		REQUIRE(a == nullptr);
+		REQUIRE(b == nullptr);
+	}
+}
+
+TEST_CASE("Rasterization never produces malformed spans", "[recast][rasterization][degenerate]")
+{
+	// Deterministic pseudo-random sweep over hostile vertex data. Every call
+	// must succeed, and every produced span must be well formed and inside the
+	// heightfield.
+	rcContext ctx(false);
+
+	constexpr int xSize = 16;
+	constexpr int zSize = 16;
+	const float minBounds[3] = {0.0f, 0.0f, 0.0f};
+	const float maxBounds[3] = {16.0f, 8.0f, 16.0f};
+
+	const float NaN = std::numeric_limits<float>::quiet_NaN();
+	const float Inf = std::numeric_limits<float>::infinity();
+
+	rcHeightfield hf;
+	REQUIRE(rcCreateHeightfield(&ctx, hf, xSize, zSize, minBounds, maxBounds, 1.0f, 1.0f));
+
+	unsigned int state = 0x12345678u;
+	auto next = [&state]()
+	{
+		state = state * 1664525u + 1013904223u;
+		return state;
+	};
+	auto nextValue = [&next, NaN, Inf]() -> float
+	{
+		switch (next() % 10u)
+		{
+		case 0: return NaN;
+		case 1: return Inf;
+		case 2: return -Inf;
+		case 3: return 3.0e38f * ((next() & 1u) ? 1.0f : -1.0f);
+		default: return ((float)(next() % 2000u) / 1000.0f - 1.0f) * 10.0f;
+		}
+	};
+
+	for (int i = 0; i < 2000; ++i)
+	{
+		float v[9];
+		for (int k = 0; k < 9; ++k) v[k] = nextValue();
+
+		// Frequently force exact degeneracy.
+		if (next() % 3u == 0) { v[3] = v[0]; v[4] = v[1]; v[5] = v[2]; }
+		if (next() % 3u == 0) { v[6] = v[0]; v[7] = v[1]; v[8] = v[2]; }
+
+		REQUIRE(rcRasterizeTriangle(&ctx, v, v + 3, v + 6, RC_WALKABLE_AREA, hf, 1));
+	}
+
+	for (int i = 0; i < xSize * zSize; ++i)
+	{
+		for (const rcSpan* span = hf.spans[i]; span != nullptr; span = span->next)
+		{
+			REQUIRE(span->smin < span->smax);
+			REQUIRE(span->smax <= RC_SPAN_MAX_HEIGHT);
 		}
 	}
 }

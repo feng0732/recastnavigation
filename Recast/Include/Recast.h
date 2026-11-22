@@ -19,6 +19,9 @@
 #ifndef RECAST_H
 #define RECAST_H
 
+#include <float.h>
+#include <string.h>
+
 /// The value of PI used by Recast.
 static const float RC_PI = 3.14159265f;
 
@@ -810,6 +813,63 @@ inline void rcVnormalize(float* v)
 	v[2] *= d;
 }
 
+/// Checks that a floating point value is finite, i.e. neither NaN nor an infinity.
+/// @param[in]		x	The value to check.
+/// @return True if the value is finite.
+inline bool rcMathIsfinite(float x)
+{
+	// The check is done on the bit pattern rather than using comparisons so it
+	// keeps working when the translation unit is compiled with -ffast-math
+	// (where the compiler is allowed to assume that NaN and infinity never
+	// occur). The exponent of a finite float never has all bits set.
+	unsigned int bits;
+	memcpy(&bits, &x, sizeof(bits));
+	return (bits & 0x7f800000u) != 0x7f800000u;
+}
+
+/// Checks that the specified vector's components are all finite.
+/// @param[in]		v	A point. [(x, y, z)]
+/// @return True if all of the point's components are finite, i.e. not NaN
+/// or any of the infinities.
+inline bool rcVisfinite(const float* v)
+{
+	return rcMathIsfinite(v[0]) && rcMathIsfinite(v[1]) && rcMathIsfinite(v[2]);
+}
+
+/// @}
+/// @name Triangle classification
+/// @{
+
+/// Describes whether a triangle can be safely voxelized.
+/// @see rcClassifyTriangle
+enum rcTriangleClassification
+{
+	/// The triangle is well formed and can be rasterized.
+	RC_TRIANGLE_VALID = 0,
+	/// At least one vertex component is NaN or infinite. Such a triangle has no
+	/// meaningful footprint and must not be voxelized.
+	RC_TRIANGLE_NON_FINITE,
+	/// The triangle has zero (or numerically vanishing) area. This covers
+	/// coincident vertices, collinear vertices and slivers whose shortest edge is
+	/// too short to define a plane. Such a triangle has no walkable surface or
+	/// height of its own and must not be voxelized.
+	RC_TRIANGLE_DEGENERATE
+};
+
+/// Classifies a triangle before voxelization.
+///
+/// The classification is purely geometric and only depends on the triangle's
+/// vertices. It does not depend on the heightfield, the tile or the build
+/// bounds, so a triangle is classified identically no matter which heightfield
+/// it is rasterized into.
+///
+/// @ingroup recast
+/// @param[in]		v0					Triangle vertex 0 [(x, y, z)]
+/// @param[in]		v1					Triangle vertex 1 [(x, y, z)]
+/// @param[in]		v2					Triangle vertex 2 [(x, y, z)]
+/// @returns The classification of the triangle.
+rcTriangleClassification rcClassifyTriangle(const float* v0, const float* v1, const float* v2);
+
 /// @}
 /// @name Heightfield Functions
 /// @see rcHeightfield
@@ -856,10 +916,15 @@ bool rcCreateHeightfield(rcContext* context, rcHeightfield& heightfield, int siz
 ///
 /// Only sets the area id's for the walkable triangles.  Does not alter the
 /// area id's for un-walkable triangles.
-/// 
+///
+/// Degenerate triangles (coincident or collinear vertices, slivers with
+/// vanishing area, or non-finite vertices) have no reliable normal and are
+/// never marked walkable. Their area ids are left untouched. They are also
+/// ignored by the rasterizer, so they never contribute spans.
+///
 /// See the #rcConfig documentation for more information on the configuration parameters.
-/// 
-/// @see rcHeightfield, rcClearUnwalkableTriangles, rcRasterizeTriangles
+///
+/// @see rcHeightfield, rcClearUnwalkableTriangles, rcRasterizeTriangles, rcClassifyTriangle
 /// 
 /// @ingroup recast
 /// @param[in,out]	context				The build context to use during the operation.
@@ -874,13 +939,17 @@ void rcMarkWalkableTriangles(rcContext* context, float walkableSlopeAngle, const
 							 const int* tris, int numTris, unsigned char* triAreaIDs); 
 
 /// Sets the area id of all triangles with a slope greater than or equal to the specified value to #RC_NULL_AREA.
-/// 
+///
 /// Only sets the area id's for the un-walkable triangles.  Does not alter the
 /// area id's for walkable triangles.
-/// 
+///
+/// Degenerate triangles (coincident or collinear vertices, slivers with
+/// vanishing area, or non-finite vertices) are always assigned #RC_NULL_AREA
+/// because they cannot be walked on.
+///
 /// See the #rcConfig documentation for more information on the configuration parameters.
-/// 
-/// @see rcHeightfield, rcClearUnwalkableTriangles, rcRasterizeTriangles
+///
+/// @see rcHeightfield, rcMarkWalkableTriangles, rcRasterizeTriangles, rcClassifyTriangle
 /// 
 /// @ingroup recast
 /// @param[in,out]	context				The build context to use during the operation.
@@ -923,7 +992,13 @@ bool rcAddSpan(rcContext* context, rcHeightfield& heightfield,
 ///
 /// No spans will be added if the triangle does not overlap the heightfield grid.
 ///
-/// @see rcHeightfield
+/// Degenerate triangles (coincident or collinear vertices, slivers with
+/// vanishing area, or non-finite vertices) are rejected before voxelization and
+/// add no spans. This makes the result independent of the heightfield layout,
+/// so a triangle spanning several tiles produces the same spans as rasterizing
+/// it into each tile separately.
+///
+/// @see rcHeightfield, rcClassifyTriangle
 /// @ingroup recast
 /// @param[in,out]	context				The build context to use during the operation.
 /// @param[in]		v0					Triangle vertex 0 [(x, y, z)]
@@ -941,12 +1016,14 @@ bool rcRasterizeTriangle(rcContext* context,
 /// Rasterizes an indexed triangle mesh into the specified heightfield.
 ///
 /// Spans will only be added for triangles that overlap the heightfield grid.
-/// 
-/// @see rcHeightfield
+/// Degenerate triangles add no spans, and triangles with out of range vertex
+/// indices are skipped.
+///
+/// @see rcHeightfield, rcClassifyTriangle
 /// @ingroup recast
 /// @param[in,out]	context				The build context to use during the operation.
 /// @param[in]		verts				The vertices. [(x, y, z) * @p nv]
-/// @param[in]		numVerts			The number of vertices. (unused) TODO (graham): Remove in next major release
+/// @param[in]		numVerts			The number of vertices. Used to validate the triangle indices. [Limit: > 0]
 /// @param[in]		tris				The triangle indices. [(vertA, vertB, vertC) * @p nt]
 /// @param[in]		triAreaIDs			The area id's of the triangles. [Limit: <= #RC_WALKABLE_AREA] [Size: @p nt]
 /// @param[in]		numTris				The number of triangles.
@@ -962,12 +1039,14 @@ bool rcRasterizeTriangles(rcContext* context,
 /// Rasterizes an indexed triangle mesh into the specified heightfield.
 ///
 /// Spans will only be added for triangles that overlap the heightfield grid.
-/// 
-/// @see rcHeightfield
+/// Degenerate triangles add no spans, and triangles with out of range vertex
+/// indices are skipped.
+///
+/// @see rcHeightfield, rcClassifyTriangle
 /// @ingroup recast
 /// @param[in,out]	context				The build context to use during the operation.
 /// @param[in]		verts				The vertices. [(x, y, z) * @p nv]
-/// @param[in]		numVerts			The number of vertices. (unused) TODO (graham): Remove in next major release
+/// @param[in]		numVerts			The number of vertices. Used to validate the triangle indices. [Limit: > 0]
 /// @param[in]		tris				The triangle indices. [(vertA, vertB, vertC) * @p nt]
 /// @param[in]		triAreaIDs			The area id's of the triangles. [Limit: <= #RC_WALKABLE_AREA] [Size: @p nt]
 /// @param[in]		numTris				The number of triangles.
@@ -985,8 +1064,9 @@ bool rcRasterizeTriangles(rcContext* context,
 /// Expects each triangle to be specified as three sequential vertices of 3 floats.
 ///
 /// Spans will only be added for triangles that overlap the heightfield grid.
-/// 
-/// @see rcHeightfield
+/// Degenerate triangles add no spans.
+///
+/// @see rcHeightfield, rcClassifyTriangle
 /// @ingroup recast
 /// @param[in,out]	context				The build context to use during the operation.
 /// @param[in]		verts				The triangle vertices. [(ax, ay, az, bx, by, bz, cx, by, cx) * @p nt]

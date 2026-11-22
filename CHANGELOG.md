@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 <h2>[Unreleased](https://github.com/recastnavigation/recastnavigation/compare/1.6.0...HEAD)</h2>
+
+### Added
+- `rcClassifyTriangle` and `rcVisfinite`/`rcMathIsfinite` helpers to classify degenerate and non-finite triangles before voxelization
+
+### Fixed
+- Degenerate triangles (coincident or collinear vertices, zero area, extremely short edges, or non-finite coordinates) are now rejected before rasterization. They no longer produce out of bounds voxels, bogus walkable flags, or uninitialized heights, and they cannot destabilize the resulting navigation mesh
+- `rcCalcBounds`, `rcCalcGridSize` and `rcCreateHeightfield` sanitize invalid input (non-finite bounds, non-positive cell size, oversized grids) instead of leaving them to undefined behavior
+
 <h2>[1.6.0](https://github.com/recastnavigation/recastnavigation/compare/1.5.1...1.6.0) - 2023-05-21</h2>
 
 ### Added

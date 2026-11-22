@@ -202,6 +202,15 @@ bool rcAddSpan(rcContext* context, rcHeightfield& heightfield,
 		return true;
 	}
 
+	// The column must exist in the heightfield. Out of bounds coordinates would
+	// otherwise write outside of the span array.
+	if (!heightfield.spans ||
+		x < 0 || z < 0 || x >= heightfield.width || z >= heightfield.height)
+	{
+		context->log(RC_LOG_WARNING, "rcAddSpan: Span is outside of the heightfield. Ignored.");
+		return true;
+	}
+
 	if (!addSpan(heightfield, x, z, spanMin, spanMax, areaID, flagMergeThreshold))
 	{
 		context->log(RC_LOG_ERROR, "rcAddSpan: Out of memory.");
@@ -217,6 +226,32 @@ enum rcAxis
 	RC_AXIS_Y = 1,
 	RC_AXIS_Z = 2
 };
+
+/// Converts a world space coordinate to a grid coordinate.
+///
+/// The floating point value is first clamped to a range that is guaranteed to
+/// fit into an int, including one cell of slack on either side of the requested
+/// range. This keeps the conversion well defined for huge (but finite)
+/// coordinate extents without changing which values are considered out of
+/// bounds by the callers.
+static int worldToGridCoord(const float value, const int low, const int high)
+{
+	// One extra cell of slack keeps values that are just outside the range
+	// distinguishable from values inside it.
+	const float minSafe = (float)(low - 1);
+	float v = value;
+	// The negated comparison also catches NaN (which compares false), mapping it
+	// to the lower bound.
+	if (!(v > minSafe))
+	{
+		v = minSafe;
+	}
+	else if (v > (float)(high + 1))
+	{
+		v = (float)(high + 1);
+	}
+	return (int)v;
+}
 
 /// Divides a convex polygon of max 12 vertices into two convex polygons
 /// across a separating axis.
@@ -235,7 +270,14 @@ static void dividePoly(const float* inVerts, int inVertsCount,
                        float axisOffset, rcAxis axis)
 {
 	rcAssert(inVertsCount <= 12);
-	
+
+	// Splitting a convex polygon adds at most one vertex per output polygon. The
+	// clamp below additionally protects the fixed size caller buffers (each can
+	// hold 7 vertices) from a corrupt input polygon whose winding cannot be
+	// resolved, which would otherwise write past the end of the stack buffers.
+	static const int kMaxOutVerts = 7;
+	const int maxOut = rcMin(inVertsCount + 1, kMaxOutVerts);
+
 	// How far positive or negative away from the separating axis is each vertex.
 	float inVertAxisDelta[12];
 	for (int inVert = 0; inVert < inVertsCount; ++inVert)
@@ -253,24 +295,33 @@ static void dividePoly(const float* inVerts, int inVertsCount,
 		if (!sameSide)
 		{
 			float s = inVertAxisDelta[inVertB] / (inVertAxisDelta[inVertB] - inVertAxisDelta[inVertA]);
-			outVerts1[poly1Vert * 3 + 0] = inVerts[inVertB * 3 + 0] + (inVerts[inVertA * 3 + 0] - inVerts[inVertB * 3 + 0]) * s;
-			outVerts1[poly1Vert * 3 + 1] = inVerts[inVertB * 3 + 1] + (inVerts[inVertA * 3 + 1] - inVerts[inVertB * 3 + 1]) * s;
-			outVerts1[poly1Vert * 3 + 2] = inVerts[inVertB * 3 + 2] + (inVerts[inVertA * 3 + 2] - inVerts[inVertB * 3 + 2]) * s;
-			rcVcopy(&outVerts2[poly2Vert * 3], &outVerts1[poly1Vert * 3]);
-			poly1Vert++;
-			poly2Vert++;
-			
+			if (poly1Vert < maxOut && poly2Vert < maxOut)
+			{
+				outVerts1[poly1Vert * 3 + 0] = inVerts[inVertB * 3 + 0] + (inVerts[inVertA * 3 + 0] - inVerts[inVertB * 3 + 0]) * s;
+				outVerts1[poly1Vert * 3 + 1] = inVerts[inVertB * 3 + 1] + (inVerts[inVertA * 3 + 1] - inVerts[inVertB * 3 + 1]) * s;
+				outVerts1[poly1Vert * 3 + 2] = inVerts[inVertB * 3 + 2] + (inVerts[inVertA * 3 + 2] - inVerts[inVertB * 3 + 2]) * s;
+				rcVcopy(&outVerts2[poly2Vert * 3], &outVerts1[poly1Vert * 3]);
+				poly1Vert++;
+				poly2Vert++;
+			}
+
 			// add the inVertA point to the right polygon. Do NOT add points that are on the dividing line
 			// since these were already added above
 			if (inVertAxisDelta[inVertA] > 0)
 			{
-				rcVcopy(&outVerts1[poly1Vert * 3], &inVerts[inVertA * 3]);
-				poly1Vert++;
+				if (poly1Vert < maxOut)
+				{
+					rcVcopy(&outVerts1[poly1Vert * 3], &inVerts[inVertA * 3]);
+					poly1Vert++;
+				}
 			}
 			else if (inVertAxisDelta[inVertA] < 0)
 			{
-				rcVcopy(&outVerts2[poly2Vert * 3], &inVerts[inVertA * 3]);
-				poly2Vert++;
+				if (poly2Vert < maxOut)
+				{
+					rcVcopy(&outVerts2[poly2Vert * 3], &inVerts[inVertA * 3]);
+					poly2Vert++;
+				}
 			}
 		}
 		else
@@ -278,15 +329,21 @@ static void dividePoly(const float* inVerts, int inVertsCount,
 			// add the inVertA point to the right polygon. Addition is done even for points on the dividing line
 			if (inVertAxisDelta[inVertA] >= 0)
 			{
-				rcVcopy(&outVerts1[poly1Vert * 3], &inVerts[inVertA * 3]);
-				poly1Vert++;
+				if (poly1Vert < maxOut)
+				{
+					rcVcopy(&outVerts1[poly1Vert * 3], &inVerts[inVertA * 3]);
+					poly1Vert++;
+				}
 				if (inVertAxisDelta[inVertA] != 0)
 				{
 					continue;
 				}
 			}
-			rcVcopy(&outVerts2[poly2Vert * 3], &inVerts[inVertA * 3]);
-			poly2Vert++;
+			if (poly2Vert < maxOut)
+			{
+				rcVcopy(&outVerts2[poly2Vert * 3], &inVerts[inVertA * 3]);
+				poly2Vert++;
+			}
 		}
 	}
 
@@ -316,6 +373,25 @@ static bool rasterizeTri(const float* v0, const float* v1, const float* v2,
                          const float cellSize, const float inverseCellSize, const float inverseCellHeight,
                          const int flagMergeThreshold)
 {
+	// Degenerate and non-finite triangles are rejected before any voxel is
+	// touched, so they can never add out of bounds spans, bogus walkable flags
+	// or uninitialized heights. Valid triangles are rasterized regardless of
+	// their area id; non-walkable (RC_NULL_AREA) triangles still contribute
+	// geometry such as walls and ceilings.
+	if (rcClassifyTriangle(v0, v1, v2) != RC_TRIANGLE_VALID)
+	{
+		return true;
+	}
+
+	// The heightfield must have a usable grid before we index into it.
+	if (heightfield.width <= 0 || heightfield.height <= 0 || !heightfield.spans ||
+		!(heightfield.cs > 0.0f) || !(heightfield.ch > 0.0f) ||
+		!rcMathIsfinite(inverseCellSize) || !rcMathIsfinite(inverseCellHeight) ||
+		!rcVisfinite(heightfieldBBMin) || !rcVisfinite(heightfieldBBMax))
+	{
+		return true;
+	}
+
 	// Calculate the bounding box of the triangle.
 	float triBBMin[3];
 	rcVcopy(triBBMin, v0);
@@ -337,9 +413,11 @@ static bool rasterizeTri(const float* v0, const float* v1, const float* v2,
 	const int h = heightfield.height;
 	const float by = heightfieldBBMax[1] - heightfieldBBMin[1];
 
-	// Calculate the footprint of the triangle on the grid's z-axis
-	int z0 = (int)((triBBMin[2] - heightfieldBBMin[2]) * inverseCellSize);
-	int z1 = (int)((triBBMax[2] - heightfieldBBMin[2]) * inverseCellSize);
+	// Calculate the footprint of the triangle on the grid's z-axis.
+	// The integer conversion is clamped in floating point space, so very large
+	// coordinate extents cannot overflow it.
+	int z0 = worldToGridCoord((triBBMin[2] - heightfieldBBMin[2]) * inverseCellSize, -1, h - 1);
+	int z1 = worldToGridCoord((triBBMax[2] - heightfieldBBMin[2]) * inverseCellSize, -1, h - 1);
 
 	// use -1 rather than 0 to cut the polygon properly at the start of the tile
 	z0 = rcClamp(z0, -1, h - 1);
@@ -388,8 +466,8 @@ static bool rasterizeTri(const float* v0, const float* v1, const float* v2,
 				maxX = inRow[vert * 3];
 			}
 		}
-		int x0 = (int)((minX - heightfieldBBMin[0]) * inverseCellSize);
-		int x1 = (int)((maxX - heightfieldBBMin[0]) * inverseCellSize);
+		int x0 = worldToGridCoord((minX - heightfieldBBMin[0]) * inverseCellSize, -1, w - 1);
+		int x1 = worldToGridCoord((maxX - heightfieldBBMin[0]) * inverseCellSize, -1, w - 1);
 		if (x1 < 0 || x0 >= w)
 		{
 			continue;
@@ -447,11 +525,29 @@ static bool rasterizeTri(const float* v0, const float* v1, const float* v2,
 				spanMax = by;
 			}
 
-			// Snap the span to the heightfield height grid.
-			unsigned short spanMinCellIndex = (unsigned short)rcClamp((int)floorf(spanMin * inverseCellHeight), 0, RC_SPAN_MAX_HEIGHT);
-			unsigned short spanMaxCellIndex = (unsigned short)rcClamp((int)ceilf(spanMax * inverseCellHeight), (int)spanMinCellIndex + 1, RC_SPAN_MAX_HEIGHT);
+			// Snap the span to the heightfield height grid. The float values are
+			// clamped before the integer conversion so extreme (but finite)
+			// heights cannot overflow it.
+			const float rawMinCell = floorf(spanMin * inverseCellHeight);
+			const float rawMaxCell = ceilf(spanMax * inverseCellHeight);
+			int spanMinCellIndex = (int)rcClamp(rawMinCell, 0.0f, (float)RC_SPAN_MAX_HEIGHT);
+			int spanMaxCellIndex = (int)rcClamp(rawMaxCell, 0.0f, (float)RC_SPAN_MAX_HEIGHT);
 
-			if (!addSpan(heightfield, x, z, spanMinCellIndex, spanMaxCellIndex, areaID, flagMergeThreshold))
+			// A flat (zero thickness) triangle still needs one cell of height so
+			// the surface is represented in the heightfield. If there is no room
+			// left above the minimum the span cannot be represented.
+			if (spanMaxCellIndex <= spanMinCellIndex)
+			{
+				if (spanMinCellIndex >= RC_SPAN_MAX_HEIGHT)
+				{
+					continue;
+				}
+				spanMaxCellIndex = spanMinCellIndex + 1;
+			}
+
+			if (!addSpan(heightfield, x, z,
+			             (unsigned short)spanMinCellIndex, (unsigned short)spanMaxCellIndex,
+			             areaID, flagMergeThreshold))
 			{
 				return false;
 			}
@@ -467,6 +563,12 @@ bool rcRasterizeTriangle(rcContext* context,
 {
 	rcAssert(context != NULL);
 
+	if (v0 == NULL || v1 == NULL || v2 == NULL)
+	{
+		context->log(RC_LOG_ERROR, "rcRasterizeTriangle: Triangle vertex pointer is null.");
+		return false;
+	}
+
 	rcScopedTimer timer(context, RC_TIMER_RASTERIZE_TRIANGLES);
 
 	// Rasterize the single triangle.
@@ -481,23 +583,73 @@ bool rcRasterizeTriangle(rcContext* context,
 	return true;
 }
 
+/// Validates the common arguments of the indexed rasterization overloads and
+/// returns false (with a log message) when they cannot be used.
+static bool validateRasterizeTrianglesArgs(rcContext* context, const char* name,
+                                           const float* verts, const unsigned char* triAreaIDs,
+                                           const int numTris, const rcHeightfield& heightfield)
+{
+	if (numTris < 0)
+	{
+		context->log(RC_LOG_ERROR, "%s: Invalid triangle count %d.", name, numTris);
+		return false;
+	}
+	if (numTris == 0)
+	{
+		return true;
+	}
+	if (verts == NULL || triAreaIDs == NULL)
+	{
+		context->log(RC_LOG_ERROR, "%s: Null vertex or area array.", name);
+		return false;
+	}
+	if (heightfield.width < 0 || heightfield.height < 0)
+	{
+		context->log(RC_LOG_ERROR, "%s: Invalid heightfield dimensions.", name);
+		return false;
+	}
+	return true;
+}
+
 bool rcRasterizeTriangles(rcContext* context,
-                          const float* verts, const int /*nv*/,
+                          const float* verts, const int numVerts,
                           const int* tris, const unsigned char* triAreaIDs, const int numTris,
                           rcHeightfield& heightfield, const int flagMergeThreshold)
 {
 	rcAssert(context != NULL);
 
+	if (!validateRasterizeTrianglesArgs(context, "rcRasterizeTriangles", verts, triAreaIDs, numTris, heightfield))
+	{
+		return false;
+	}
+	if (numTris > 0 && tris == NULL)
+	{
+		context->log(RC_LOG_ERROR, "rcRasterizeTriangles: Null triangle index array.");
+		return false;
+	}
+
 	rcScopedTimer timer(context, RC_TIMER_RASTERIZE_TRIANGLES);
-	
+
 	// Rasterize the triangles.
 	const float inverseCellSize = 1.0f / heightfield.cs;
 	const float inverseCellHeight = 1.0f / heightfield.ch;
 	for (int triIndex = 0; triIndex < numTris; ++triIndex)
 	{
-		const float* v0 = &verts[tris[triIndex * 3 + 0] * 3];
-		const float* v1 = &verts[tris[triIndex * 3 + 1] * 3];
-		const float* v2 = &verts[tris[triIndex * 3 + 2] * 3];
+		const int i0 = tris[triIndex * 3 + 0];
+		const int i1 = tris[triIndex * 3 + 1];
+		const int i2 = tris[triIndex * 3 + 2];
+
+		// Out of range vertex indices cannot describe a triangle. Skipping them
+		// keeps a malformed mesh from reading outside of the vertex array.
+		if (numVerts > 0 &&
+			(i0 < 0 || i0 >= numVerts || i1 < 0 || i1 >= numVerts || i2 < 0 || i2 >= numVerts))
+		{
+			continue;
+		}
+
+		const float* v0 = &verts[i0 * 3];
+		const float* v1 = &verts[i1 * 3];
+		const float* v2 = &verts[i2 * 3];
 		if (!rasterizeTri(v0, v1, v2, triAreaIDs[triIndex], heightfield, heightfield.bmin, heightfield.bmax, heightfield.cs, inverseCellSize, inverseCellHeight, flagMergeThreshold))
 		{
 			context->log(RC_LOG_ERROR, "rcRasterizeTriangles: Out of memory.");
@@ -509,11 +661,21 @@ bool rcRasterizeTriangles(rcContext* context,
 }
 
 bool rcRasterizeTriangles(rcContext* context,
-                          const float* verts, const int /*nv*/,
+                          const float* verts, const int numVerts,
                           const unsigned short* tris, const unsigned char* triAreaIDs, const int numTris,
                           rcHeightfield& heightfield, const int flagMergeThreshold)
 {
 	rcAssert(context != NULL);
+
+	if (!validateRasterizeTrianglesArgs(context, "rcRasterizeTriangles", verts, triAreaIDs, numTris, heightfield))
+	{
+		return false;
+	}
+	if (numTris > 0 && tris == NULL)
+	{
+		context->log(RC_LOG_ERROR, "rcRasterizeTriangles: Null triangle index array.");
+		return false;
+	}
 
 	rcScopedTimer timer(context, RC_TIMER_RASTERIZE_TRIANGLES);
 
@@ -522,9 +684,19 @@ bool rcRasterizeTriangles(rcContext* context,
 	const float inverseCellHeight = 1.0f / heightfield.ch;
 	for (int triIndex = 0; triIndex < numTris; ++triIndex)
 	{
-		const float* v0 = &verts[tris[triIndex * 3 + 0] * 3];
-		const float* v1 = &verts[tris[triIndex * 3 + 1] * 3];
-		const float* v2 = &verts[tris[triIndex * 3 + 2] * 3];
+		const unsigned short i0 = tris[triIndex * 3 + 0];
+		const unsigned short i1 = tris[triIndex * 3 + 1];
+		const unsigned short i2 = tris[triIndex * 3 + 2];
+
+		if (numVerts > 0 &&
+			(i0 >= numVerts || i1 >= numVerts || i2 >= numVerts))
+		{
+			continue;
+		}
+
+		const float* v0 = &verts[i0 * 3];
+		const float* v1 = &verts[i1 * 3];
+		const float* v2 = &verts[i2 * 3];
 		if (!rasterizeTri(v0, v1, v2, triAreaIDs[triIndex], heightfield, heightfield.bmin, heightfield.bmax, heightfield.cs, inverseCellSize, inverseCellHeight, flagMergeThreshold))
 		{
 			context->log(RC_LOG_ERROR, "rcRasterizeTriangles: Out of memory.");
@@ -541,8 +713,13 @@ bool rcRasterizeTriangles(rcContext* context,
 {
 	rcAssert(context != NULL);
 
+	if (!validateRasterizeTrianglesArgs(context, "rcRasterizeTriangles", verts, triAreaIDs, numTris, heightfield))
+	{
+		return false;
+	}
+
 	rcScopedTimer timer(context, RC_TIMER_RASTERIZE_TRIANGLES);
-	
+
 	// Rasterize the triangles.
 	const float inverseCellSize = 1.0f / heightfield.cs;
 	const float inverseCellHeight = 1.0f / heightfield.ch;

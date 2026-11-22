@@ -24,6 +24,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <limits.h>
+#include <stddef.h>
 
 namespace
 {
@@ -286,28 +288,102 @@ rcPolyMeshDetail::rcPolyMeshDetail()
 
 void rcCalcBounds(const float* verts, int numVerts, float* minBounds, float* maxBounds)
 {
-	// Calculate bounding box.
-	rcVcopy(minBounds, verts);
-	rcVcopy(maxBounds, verts);
-	for (int i = 1; i < numVerts; ++i)
+	if (!verts || numVerts <= 0)
+	{
+		minBounds[0] = minBounds[1] = minBounds[2] = 0.0f;
+		maxBounds[0] = maxBounds[1] = maxBounds[2] = 0.0f;
+		return;
+	}
+
+	// Non-finite vertices carry no meaningful bounds information. Skipping
+	// them keeps a single bad vertex from poisoning the whole build with NaN
+	// or infinite extents (which would later turn into an invalid grid size).
+	bool initialized = false;
+	for (int i = 0; i < numVerts; ++i)
 	{
 		const float* v = &verts[i * 3];
+		if (!rcVisfinite(v))
+		{
+			continue;
+		}
+
+		if (!initialized)
+		{
+			rcVcopy(minBounds, v);
+			rcVcopy(maxBounds, v);
+			initialized = true;
+			continue;
+		}
+
 		rcVmin(minBounds, v);
 		rcVmax(maxBounds, v);
+	}
+
+	if (!initialized)
+	{
+		minBounds[0] = minBounds[1] = minBounds[2] = 0.0f;
+		maxBounds[0] = maxBounds[1] = maxBounds[2] = 0.0f;
 	}
 }
 
 void rcCalcGridSize(const float* minBounds, const float* maxBounds, const float cellSize, int* sizeX, int* sizeZ)
 {
-	*sizeX = (int)((maxBounds[0] - minBounds[0]) / cellSize + 0.5f);
-	*sizeZ = (int)((maxBounds[2] - minBounds[2]) / cellSize + 0.5f);
+	// A non-positive cell size or non-finite bounds cannot describe a grid.
+	// Returning a zero sized grid keeps the failure visible to the caller
+	// instead of overflowing the integer conversion.
+	if (!(cellSize > 0.0f) || !rcVisfinite(minBounds) || !rcVisfinite(maxBounds))
+	{
+		*sizeX = 0;
+		*sizeZ = 0;
+		return;
+	}
+
+	// Keep the original float arithmetic so the result is bit-for-bit identical
+	// for well formed input. The clamp only affects huge (but finite) extents
+	// which would otherwise overflow the integer conversion.
+	const float sizeXf = (maxBounds[0] - minBounds[0]) / cellSize + 0.5f;
+	const float sizeZf = (maxBounds[2] - minBounds[2]) / cellSize + 0.5f;
+
+	// Widening to double is exact and makes the comparison against INT_MAX well
+	// defined for every float value.
+	double dx = (double)sizeXf;
+	double dz = (double)sizeZf;
+	if (dx < 0.0) dx = 0.0;
+	if (dz < 0.0) dz = 0.0;
+	if (dx > (double)INT_MAX) dx = (double)INT_MAX;
+	if (dz > (double)INT_MAX) dz = (double)INT_MAX;
+	*sizeX = (int)dx;
+	*sizeZ = (int)dz;
 }
 
 bool rcCreateHeightfield(rcContext* context, rcHeightfield& heightfield, int sizeX, int sizeZ,
                          const float* minBounds, const float* maxBounds,
                          float cellSize, float cellHeight)
 {
-	rcIgnoreUnused(context);
+	// Reject configurations that cannot describe a valid heightfield. Without
+	// this a bad input (negative size, zero cell size or NaN bounds) would
+	// either allocate a nonsensical amount of memory or produce spans whose
+	// indices are undefined.
+	if (sizeX < 0 || sizeZ < 0 ||
+		!(cellSize > 0.0f) || !(cellHeight > 0.0f) ||
+		!rcVisfinite(minBounds) || !rcVisfinite(maxBounds))
+	{
+		if (context)
+		{
+			context->log(RC_LOG_ERROR, "rcCreateHeightfield: Invalid heightfield parameters.");
+		}
+		return false;
+	}
+
+	// Guard against the multiplication below overflowing a size_t / int.
+	if ((size_t)sizeX > (size_t)(-1) / sizeof(rcSpan*) / (size_t)(sizeZ > 0 ? sizeZ : 1))
+	{
+		if (context)
+		{
+			context->log(RC_LOG_ERROR, "rcCreateHeightfield: Heightfield is too large.");
+		}
+		return false;
+	}
 
 	heightfield.width = sizeX;
 	heightfield.height = sizeZ;
@@ -315,12 +391,21 @@ bool rcCreateHeightfield(rcContext* context, rcHeightfield& heightfield, int siz
 	rcVcopy(heightfield.bmax, maxBounds);
 	heightfield.cs = cellSize;
 	heightfield.ch = cellHeight;
-	heightfield.spans = (rcSpan**)rcAlloc(sizeof(rcSpan*) * heightfield.width * heightfield.height, RC_ALLOC_PERM);
+
+	const int numColumns = heightfield.width * heightfield.height;
+	if (numColumns == 0)
+	{
+		// A heightfield with no columns is valid but empty.
+		heightfield.spans = NULL;
+		return true;
+	}
+
+	heightfield.spans = (rcSpan**)rcAlloc(sizeof(rcSpan*) * numColumns, RC_ALLOC_PERM);
 	if (!heightfield.spans)
 	{
 		return false;
 	}
-	memset(heightfield.spans, 0, sizeof(rcSpan*) * heightfield.width * heightfield.height);
+	memset(heightfield.spans, 0, sizeof(rcSpan*) * numColumns);
 	return true;
 }
 
@@ -331,6 +416,91 @@ static void calcTriNormal(const float* v0, const float* v1, const float* v2, flo
 	rcVsub(e1, v2, v0);
 	rcVcross(faceNormal, e0, e1);
 	rcVnormalize(faceNormal);
+}
+
+rcTriangleClassification rcClassifyTriangle(const float* v0, const float* v1, const float* v2)
+{
+	// A triangle whose shortest edge is below this fraction of its longest edge
+	// cannot define a plane reliably; the resulting normal would be dominated
+	// by floating point noise.
+	static const float MIN_EDGE_RATIO = 1e-6f;
+	// A triangle whose area is below this fraction of its squared longest edge
+	// is numerically collinear (coincident or collinear vertices and slivers).
+	static const float MIN_AREA_RATIO = 1e-6f;
+
+	if (v0 == NULL || v1 == NULL || v2 == NULL)
+	{
+		return RC_TRIANGLE_NON_FINITE;
+	}
+
+	// NaN and infinite coordinates cannot be mapped to a voxel position.
+	if (!rcVisfinite(v0) || !rcVisfinite(v1) || !rcVisfinite(v2))
+	{
+		return RC_TRIANGLE_NON_FINITE;
+	}
+
+	float e0[3], e1[3], e2[3];
+	rcVsub(e0, v1, v0);
+	rcVsub(e1, v2, v0);
+	rcVsub(e2, v2, v1);
+
+	// The difference of two finite but extremely large coordinates can still
+	// overflow to an infinity. Such a triangle has no usable extent.
+	if (!rcVisfinite(e0) || !rcVisfinite(e1) || !rcVisfinite(e2))
+	{
+		return RC_TRIANGLE_NON_FINITE;
+	}
+
+	float cross[3];
+	rcVcross(cross, e0, e1);
+	if (!rcVisfinite(cross))
+	{
+		return RC_TRIANGLE_NON_FINITE;
+	}
+
+	// Squared edge lengths are used so the classification is independent of the
+	// triangle's position and orientation. It only depends on the triangle
+	// itself, which keeps the result stable across tiles and repeated builds.
+	const float len0Sq = rcVdot(e0, e0);
+	const float len1Sq = rcVdot(e1, e1);
+	const float len2Sq = rcVdot(e2, e2);
+
+	// Values large enough to overflow the squared lengths cannot be compared
+	// reliably and cannot be voxelized with meaningful precision.
+	if (!rcMathIsfinite(len0Sq) || !rcMathIsfinite(len1Sq) || !rcMathIsfinite(len2Sq))
+	{
+		return RC_TRIANGLE_NON_FINITE;
+	}
+
+	const float maxEdgeSq = rcMax(len0Sq, rcMax(len1Sq, len2Sq));
+	const float minEdgeSq = rcMin(len0Sq, rcMin(len1Sq, len2Sq));
+
+	// All vertices coincide (or the edges underflow to zero).
+	if (!(maxEdgeSq > 0.0f))
+	{
+		return RC_TRIANGLE_DEGENERATE;
+	}
+
+	// An extremely short edge makes the resulting normal (and therefore the
+	// slope classification) numerically meaningless.
+	if (!(minEdgeSq > maxEdgeSq * (MIN_EDGE_RATIO * MIN_EDGE_RATIO)))
+	{
+		return RC_TRIANGLE_DEGENERATE;
+	}
+
+	// Zero or near-zero area: coincident and collinear vertices.
+	const float crossLenSq = rcVdot(cross, cross);
+	if (!rcMathIsfinite(crossLenSq))
+	{
+		return RC_TRIANGLE_NON_FINITE;
+	}
+	const float crossLen = rcSqrt(crossLenSq);
+	if (!(crossLen > maxEdgeSq * MIN_AREA_RATIO))
+	{
+		return RC_TRIANGLE_DEGENERATE;
+	}
+
+	return RC_TRIANGLE_VALID;
 }
 
 void rcMarkWalkableTriangles(rcContext* context, const float walkableSlopeAngle,
@@ -348,7 +518,29 @@ void rcMarkWalkableTriangles(rcContext* context, const float walkableSlopeAngle,
 	for (int i = 0; i < numTris; ++i)
 	{
 		const int* tri = &tris[i * 3];
-		calcTriNormal(&verts[tri[0] * 3], &verts[tri[1] * 3], &verts[tri[2] * 3], norm);
+		if (numVerts > 0 && (tri[0] < 0 || tri[0] >= numVerts ||
+		                     tri[1] < 0 || tri[1] >= numVerts ||
+		                     tri[2] < 0 || tri[2] >= numVerts))
+		{
+			// Out of range indices cannot describe a triangle. Leave the area id
+			// untouched rather than indexing outside of the vertex array.
+			continue;
+		}
+
+		const float* v0 = &verts[tri[0] * 3];
+		const float* v1 = &verts[tri[1] * 3];
+		const float* v2 = &verts[tri[2] * 3];
+
+		// Degenerate triangles have no reliable normal, so they are never
+		// classified as walkable. Their area ids are left untouched, matching
+		// the documented behavior for unwalkable triangles. They are skipped by
+		// the rasterizer as well, so no span is ever created for them.
+		if (rcClassifyTriangle(v0, v1, v2) != RC_TRIANGLE_VALID)
+		{
+			continue;
+		}
+
+		calcTriNormal(v0, v1, v2, norm);
 		// Check if the face is walkable.
 		if (norm[1] > walkableThr)
 		{
@@ -372,7 +564,27 @@ void rcClearUnwalkableTriangles(rcContext* context, const float walkableSlopeAng
 	for (int i = 0; i < numTris; ++i)
 	{
 		const int* tri = &tris[i * 3];
-		calcTriNormal(&verts[tri[0] * 3], &verts[tri[1] * 3], &verts[tri[2] * 3], faceNormal);
+		if (numVerts > 0 && (tri[0] < 0 || tri[0] >= numVerts ||
+		                     tri[1] < 0 || tri[1] >= numVerts ||
+		                     tri[2] < 0 || tri[2] >= numVerts))
+		{
+			continue;
+		}
+
+		const float* v0 = &verts[tri[0] * 3];
+		const float* v1 = &verts[tri[1] * 3];
+		const float* v2 = &verts[tri[2] * 3];
+
+		// Degenerate triangles cannot be walked on. Make sure they end up with
+		// a null area instead of keeping a stale walkable id (their normals are
+		// undefined and would otherwise fail both slope comparisons).
+		if (rcClassifyTriangle(v0, v1, v2) != RC_TRIANGLE_VALID)
+		{
+			triAreaIDs[i] = RC_NULL_AREA;
+			continue;
+		}
+
+		calcTriNormal(v0, v1, v2, faceNormal);
 		// Check if the face is walkable.
 		if (faceNormal[1] <= walkableLimitY)
 		{
@@ -423,6 +635,18 @@ bool rcBuildCompactHeightfield(rcContext* context, const int walkableHeight, con
 	compactHeightfield.bmax[1] += walkableHeight * heightfield.ch;
 	compactHeightfield.cs = heightfield.cs;
 	compactHeightfield.ch = heightfield.ch;
+
+	// An empty grid has no cells or spans to build. Leave the arrays empty so
+	// the rest of the pipeline can handle it without allocating zero sized
+	// buffers or dereferencing a null span array.
+	if (xSize <= 0 || zSize <= 0 || !heightfield.spans)
+	{
+		compactHeightfield.cells = NULL;
+		compactHeightfield.spans = NULL;
+		compactHeightfield.areas = NULL;
+		return true;
+	}
+
 	compactHeightfield.cells = (rcCompactCell*)rcAlloc(sizeof(rcCompactCell) * xSize * zSize, RC_ALLOC_PERM);
 	if (!compactHeightfield.cells)
 	{
